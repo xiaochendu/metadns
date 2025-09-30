@@ -328,6 +328,8 @@ def potts_2pt_corr_direction(S, q, r_x = 1, r_y = 0, use_x = True, use_y = False
     if not isinstance(S, torch.Tensor):
         S = torch.from_numpy(S)
         
+    if S.ndim == 2:
+        S = S.reshape(S.shape[0], int(np.sqrt(S.shape[1])), int(np.sqrt(S.shape[1])))
     B, L, L = S.shape
     corr = torch.zeros_like(S, dtype=torch.float)
     
@@ -550,6 +552,9 @@ def potts2d_swendsen_wang(L, J=1, beta=.5, q=3, B=256, num_collect=20000,
 
 
 def visualize_potts(S, q, k_x, k_y):    # Convert to numpy if it's a torch tensor
+    if S.ndim == 2:
+        S = S.reshape(S.shape[0], int(np.sqrt(S.shape[1])), int(np.sqrt(S.shape[1])))
+    
     if isinstance(S, torch.Tensor):
         S = S.detach().cpu().numpy()
     assert k_x * k_y == S.shape[0], "k_x * k_y must be equal to the number of samples"

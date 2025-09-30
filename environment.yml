@@ -1,4 +1,4 @@
-name: MDNS
+name: mdns
 channels:
   - pytorch
   - conda-forge
@@ -18,4 +18,5 @@ dependencies:
   - pip
   - pip:
       - timm
+      - notebook
 

@@ -248,8 +248,12 @@ def ising1d_llh(sigmas, J, h, beta, Z=None):
 
 
 def visualize_ising(S, k_x, k_y):    # Convert to numpy if it's a torch tensor
+    S = 2 * S - 1
     if isinstance(S, torch.Tensor):
         S = S.detach().cpu().numpy()
+    
+    if S.ndim == 2:
+        S = S.reshape(-1, int(np.sqrt(S.shape[1])), int(np.sqrt(S.shape[1])))
     assert k_x * k_y == S.shape[0], "k_x * k_y must be equal to the number of samples"
     B = S.shape[0]
     # Check if B is a perfect square
@@ -326,3 +330,113 @@ def ising2d_mag_direction(S, use_row = True, use_col = False):
         return S.float().mean(dim=1).mean(dim = 0)
     if use_col:
         return S.float().mean(dim=2).mean(dim = 0)
+
+
+def ising2d_swendsen_wang(L, J=1, beta=.5, B=256, num_collect=20000, 
+                         burn_in=10000, collect_every=1000, init=None):
+    """
+    Swendsen-Wang algorithm to sample from the 2D Ising model's distribution.
+    
+    Parameters:
+    - L: int, size of the lattice (L * L)
+    - J: float, coupling constant
+    - beta: float, inverse temperature
+    - B: int, number of parallel configurations
+    - num_collect: int, number of times to collect
+    - burn_in: int, number of initial steps to discard
+    - collect_every: int, collect a sample every `collect_every` steps
+    - init: numpy.ndarray of shape (B, L, L) or (B, L * L), initial configuration
+    
+    Returns:
+    - samples: numpy.ndarray of shape (num_collect * B, L * L), sampled configurations
+    """
+    # Initialize the lattice
+    if init is None:
+        S = np.random.choice([-1, 1], size=(B, L, L))
+    else:
+        S = init.reshape(B, L, L) if init.ndim == 2 else init
+    
+    samples = []
+    total_steps = burn_in + num_collect * collect_every
+    
+    # Pre-compute bond probability
+    p = 1 - np.exp(-2 * beta * J)
+    
+    for step in tqdm(range(total_steps)):
+        # For each configuration in the batch
+        for b in range(B):
+            # Step 1: Identify bonds between aligned spins
+            # Create arrays for horizontal and vertical bonds
+            h_bonds = np.zeros((L, L), dtype=bool)  # horizontal bonds
+            v_bonds = np.zeros((L, L), dtype=bool)  # vertical bonds
+            
+            # Check horizontal bonds (same spin alignment)
+            h_bonds[:, :-1] = (S[b, :, :-1] == S[b, :, 1:])
+            h_bonds[:, -1] = (S[b, :, -1] == S[b, :, 0])  # periodic BC
+            
+            # Check vertical bonds (same spin alignment)
+            v_bonds[:-1, :] = (S[b, :-1, :] == S[b, 1:, :])
+            v_bonds[-1, :] = (S[b, -1, :] == S[b, 0, :])  # periodic BC
+            
+            # Step 2: Activate bonds with probability p
+            h_bonds = h_bonds & (np.random.random((L, L)) < p)
+            v_bonds = v_bonds & (np.random.random((L, L)) < p)
+            
+            # Step 3: Identify clusters using Union-Find
+            # Initialize parent array for Union-Find
+            parent = np.arange(L * L).reshape(L, L)
+            rank = np.zeros((L, L), dtype=int)
+            
+            def find(x, y):
+                if parent[x, y] != x * L + y:
+                    px, py = parent[x, y] // L, parent[x, y] % L
+                    parent[x, y] = find(px, py)
+                return parent[x, y]
+            
+            def union(x1, y1, x2, y2):
+                root1 = find(x1, y1)
+                root2 = find(x2, y2)
+                if root1 != root2:
+                    r1, c1 = root1 // L, root1 % L
+                    r2, c2 = root2 // L, root2 % L
+                    if rank[r1, c1] < rank[r2, c2]:
+                        parent[r1, c1] = root2
+                    else:
+                        parent[r2, c2] = root1
+                        if rank[r1, c1] == rank[r2, c2]:
+                            rank[r1, c1] += 1
+            
+            # Process horizontal bonds
+            for i in range(L):
+                for j in range(L):
+                    if h_bonds[i, j]:
+                        union(i, j, i, (j + 1) % L)
+            
+            # Process vertical bonds
+            for i in range(L):
+                for j in range(L):
+                    if v_bonds[i, j]:
+                        union(i, j, (i + 1) % L, j)
+            
+            # Step 4: Identify clusters
+            clusters = {}
+            for i in range(L):
+                for j in range(L):
+                    root = find(i, j)
+                    if root not in clusters:
+                        clusters[root] = []
+                    clusters[root].append((i, j))
+            
+            # Step 5: Flip clusters with probability 0.5
+            for cluster in clusters.values():
+                # Randomly decide whether to flip the cluster
+                if np.random.random() < 0.5:
+                    # Flip all spins in the cluster
+                    for i, j in cluster:
+                        S[b, i, j] *= -1
+        
+        # Collect samples after burn-in
+        if step >= burn_in and (step - burn_in) % collect_every == 0:
+            samples.append(S.reshape(B, L*L).copy())
+    
+    return np.concatenate(samples, axis=0)

@@ -12,7 +12,7 @@ Welcome to the official implementation for **MDNS** (accepted at NeurIPS 2025), 
 ## Environment
 ```
 conda env create -f environment.yml
-conda activate MDNS
+conda activate mdns
 ```
 
 ## Training
