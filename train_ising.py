@@ -1,15 +1,14 @@
 import torch
 from model import get_rope_vit_model, ExponentialMovingAverage
-from utils_ising import ising2d_ham
 from utils import Dict2Obj, plot_loss_ess
 from utils_train import train
-from datetime import datetime
+from utils_ising import ising2d_ham
 from warnings import simplefilter
 import matplotlib.pyplot as plt
 simplefilter(action='ignore', category=FutureWarning)
 import os
 import argparse
-from pprint import  pformat
+from pprint import pformat
 import json
 
 parser = argparse.ArgumentParser()
@@ -40,7 +39,7 @@ anneal_beta = args.anneal_beta
 dir_name = f'exp_local/L_{L}_ising_beta_{beta}_J_{J}/{args.dir_name}'
 os.makedirs(dir_name, exist_ok=True)
 
-def reward_fn_ising(S, beta=0.28, J=1): 
+def reward_fn_ising(S, beta=0.28, J=1, h=0): 
     return -beta * ising2d_ham(2*S-1, J, h)
 
 cfg = {'tokens': 2,
@@ -52,15 +51,16 @@ cfg = {'tokens': 2,
        "beta": beta,
        "J": J,
        "dir_name": args.dir_name,
-       'model': {'name': 'small_radd', 'type': 'ddit_wot', 'hidden_size': 64, # 64, 64, 6
-                'cond_dim': 64, 'length': D, 'n_blocks': 4, 'n_heads': 4, 
-                'dropout': 0.0, 'use_checkpoint': False, 'dtype': 'bfloat16'},
-       'grad_clip': False, 'gradnorm_clip': 1, 'num_epochs': args.num_epochs, 'resample_every_n_step': 10,
-       'warmup_steps': 0,
-       'num_accum_steps': 1, 'batch_size': 128, 'copy_flag_temp': None, 'truncate_steps': 32,
-       'truncate_kl': False, 'total_num_steps': 32, 'gumbel_temp': 1, 'gumbel_temp_schedule': 'const', 
-       'gumbel_temp_min': 0.1, 'eval_every': 20, 'eval_batch_size': 32,
-       'loss_fn': 'wdce', 'wdce_num_replicates': 8, 'seed': None}
+       'model': {'hidden_size': 64, 'n_blocks': 4, 'n_heads': 4, 'length': D, 
+                 'use_checkpoint': False, 'dtype': 'bfloat16'},
+       'num_epochs': args.num_epochs,
+       'resample_every_n_step': 10,
+       'batch_size': 128, 
+       'eval_every': 20, 'eval_batch_size': 32,
+       'grad_clip': False, 'gradnorm_clip': 1,
+       'loss_fn': 'wdce',
+       'wdce_num_replicates': 8,
+       'seed': None}
 
 model = get_rope_vit_model(L, embed_dim=cfg['model']['hidden_size'], 
                           depth=cfg['model']['n_blocks'], 
@@ -73,8 +73,6 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.00)
 print('Model: num of params: {}, size: {:.2f} MB'.format(
     sum(p.numel() for p in model.parameters()),
     sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2)))
-
-scheduler = None
 
 print(f"Training config:\n{pformat(cfg)}")
 with open(os.path.join(dir_name, 'config.json'), 'w') as f:
@@ -98,8 +96,8 @@ if not args.use_anneal:
         
     model.train()
     model, optimizer, ema, losses, ess_train, ess_eval = train(
-        model, optimizer, lambda x: reward_fn_ising(x, beta=beta, J=J), 
-        Dict2Obj(cfg), device, ema=ema, scheduler=scheduler, num_epochs=args.num_epochs,
+        model, optimizer, lambda x: reward_fn_ising(x, beta=beta, J=J, h=h), 
+        Dict2Obj(cfg), device, ema=ema, num_epochs=args.num_epochs,
         losses=losses, ess_train=ess_train, ess_eval=ess_eval)
     
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
@@ -114,9 +112,8 @@ if not args.use_anneal:
 else:
     model.train()
     model, optimizer, ema, losses, ess_train, ess_eval = train(
-            model, optimizer, lambda x: reward_fn_ising(x, beta=args.anneal_beta, J=J), 
-            Dict2Obj(cfg), device, num_epochs=args.anneal_epochs, 
-            ema=ema, scheduler=scheduler)
+            model, optimizer, lambda x: reward_fn_ising(x, beta=args.anneal_beta, J=J, h=h), 
+            Dict2Obj(cfg), device, num_epochs=args.anneal_epochs, ema=ema)
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess_anneal.png")
     torch.save({
@@ -128,9 +125,9 @@ else:
         'cfg': cfg}, f'{dir_name}/weights_warmup.pth')
     
     model, optimizer, ema, losses, ess_train, ess_eval = train(
-        model, optimizer, lambda x: reward_fn_ising(x, beta=beta, J=J), 
+        model, optimizer, lambda x: reward_fn_ising(x, beta=beta, J=J, h=h), 
         Dict2Obj(cfg), device, num_epochs=args.num_epochs, 
-        ema=ema, scheduler=scheduler, losses=losses, ess_train=ess_train, ess_eval=ess_eval)
+        ema=ema, losses=losses, ess_train=ess_train, ess_eval=ess_eval)
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")
     torch.save({

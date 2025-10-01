@@ -21,8 +21,8 @@ The commands for training MDNS on Ising and Potts models are listed in `train_co
 ## Checkpoints
 We included checkpoints trained with MDNS for Ising and Potts model on 2D square lattice under the folder `checkpoints`. 
 
-- For Ising model, we include those on 16x16 and 24x24 square lattice, across three different temperatures $\beta_{\text{high}} = 0.28$, $\beta_{\text{critical}} = 0.4407$, and $\beta_{\text{low}} = 0.6$. We named them correspondingly as `ising_high.pth`, `ising_crit.pth` and `ising_low.pth` under the directory.
-- For Potts model, we include those on 16x16 square lattice, across three different temperatures $\beta_{\text{high}} = 0.4$, $\beta_{\text{critical}} = 1.005$, and $\beta_{\text{low}} = 1.2$. We named them correspondingly as `potts_high.pth`, `potts_crit.pth` and `potts_low.pth` under the directory.
+- For Ising model, we include those on $16\times16$ and $24\times24$ square lattices, across three different inverse temperatures $\beta_{\text{high}} = 0.28$, $\beta_{\text{critical}} = 0.4407$, and $\beta_{\text{low}} = 0.6$. We named them correspondingly as `ising_high.pth`, `ising_crit.pth` and `ising_low.pth` under the directory.
+- For Potts model, we include those on $16\times16$ square lattice with $q=3$, across three different inverse temperatures $\beta_{\text{high}} = 0.5$, $\beta_{\text{critical}} = 1.005$, and $\beta_{\text{low}} = 1.2$. We named them correspondingly as `potts_high.pth`, `potts_crit.pth` and `potts_low.pth` under the directory.
 
 
 ## Evaluation
@@ -34,14 +34,16 @@ If you find our work and repo help, we would appreciate your citations :smiling_
 
 
 ```
-@article{zhu2025mdns,
-  title={MDNS: Masked Diffusion Neural Sampler via Stochastic Optimal Control},
-  author={Zhu, Yuchen and Guo, Wei and Choi, Jaemoo and Liu, Guan-Horng and Chen, Yongxin and Tao, Molei},
-  journal={arXiv preprint arXiv:2508.10684},
-  year={2025}
+@inproceedings{zhu2025mdns,
+  title     = {{MDNS}: Masked Diffusion Neural Sampler via Stochastic Optimal Control},
+  author    = {Zhu, Yuchen and Guo, Wei and Choi, Jaemoo and Liu, Guan-Horng and Chen, Yongxin and Tao, Molei},
+  booktitle = {The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+  year      = {2025},
+  url       = {https://openreview.net/forum?id=xIH95kXNR2}
 }
 ```
 
 
+## Acknowledgement
 
-
+Our code is partially based on the [rope-vit](https://github.com/naver-ai/rope-vit) repository (under Apache License 2.0).

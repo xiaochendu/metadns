@@ -1,9 +1,6 @@
 """
-Utility functions for the 1D and 2D Ising models
-
-Only MH sampling is implemented by numpy,
-other functions are implemented by torch.
-
+Utility functions for the 2D Ising models
+Only MH sampling is implemented by numpy, other functions are implemented by torch.
 Please be aware of the input shape and range before use!
 """
 
@@ -20,11 +17,8 @@ def ising2d_ham(S, J=1.0, h=0.0):
     Compute the Hamiltonian for a batch of configurations in a 2D Ising model, with periodic boundary conditions.
     
     Parameters:
-    - S: torch.tensor of shape 
-        1) (B, L * L):
-            each element is -1 or 1, representing spin configurations.
-        2) (B, L * L, 2):
-            the last dimension contains the probability of that spin being -1 and 1, respectively.
+    - S: torch.tensor of shape (B, L * L)
+        each element is -1 or 1 (not 0 or 1!), representing spin configurations.
     - J: float, interaction strength between neighboring spins (default=1.0).
     - h: float, external magnetic field strength (default=0.0).
 
@@ -33,13 +27,8 @@ def ising2d_ham(S, J=1.0, h=0.0):
         H = -J \sum_{i \sim j} S_{i} S_{j} - h \sum_{i} S_{i}
     (The p.m.f. is given by p(S) \propto e^{-\beta H(S)})
     """
-    if S.ndim == 2:
-        assert torch.all((S == 1) | (S == -1)), "All entries of S must be either 1 or -1"
-    elif S.ndim == 3:
-        assert S.shape[2] == 2, "Input tensor must have shape (B, L * L, 2)"
-        S = S[..., 1] - S[..., 0]  # convert to average spins, now (B, L * L)
-    else:
-        raise ValueError(f"Invalid input shape {S.shape}.")
+    # assert S.ndim == 2
+    # assert torch.all((S == 1) | (S == -1)), "All entries of S must be either 1 or -1"
 
     S = S.view(S.size(0), int(S.shape[1]**.5), int(S.shape[1]**.5))
     Sx = torch.roll(S, shifts=-1, dims=1)  # Sx[i,j] = S[i+1,j]
@@ -99,9 +88,6 @@ def ising2d_2pt_corr(S, rx, ry):
     """
     assert torch.all((S == 1) | (S == -1)), "All entries of S must be either 1 or -1"
     S = S.view(S.size(0), int(S.shape[1]**.5), int(S.shape[1]**.5))
-    
-    
-    
     Sx = torch.roll(S, shifts=-rx, dims=1)
     Sy = torch.roll(S, shifts=-ry, dims=2)
     return (S * (Sx + Sy)).float().view(S.size(0), -1).mean(dim=1)
@@ -183,68 +169,6 @@ def ising2d_row_col_mag(S, axis=0):
     L = int(S.shape[1]**.5)
     S = S.view(S.size(0), L, L)
     return S.float().mean(dim=axis+1)  # +1 because first dim is batch
-
-
-########################################
-# Codes for 1D have not been checked and we will not use them
-
-def ising1d_mh(N, J, h, beta, steps, burn_in=0, collect_every=100):
-    """
-    Samples from the 1D Ising model using the Metropolis algorithm.
-
-    Parameters:
-    - N: Number of spins
-    - J: Coupling constant
-    - h: External magnetic field
-    - beta: Inverse temperature (1 / (k_B * T))
-    - steps: Number of MCMC steps
-
-    The density is exp(-beta * H(sigma)), where
-    H(sigma) = -J sum_{i=0}^{N-1} sigma[i] sigma[i+1] - h sum_{i=0}^{N-1} sigma[i]
-    """
-    spins = np.random.choice([-1, 1], size=N)
-    all_spins = []
-
-    def delta_energy(spins, i):
-        left = spins[i - 1] if i > 0 else 0  # Handle left boundary
-        right = spins[i + 1] if i < N - 1 else 0  # Handle right boundary
-        return 2 * J * spins[i] * (left + right) + 2 * h * spins[i]
-
-    for step in range(steps):
-        spins = spins.copy()
-        i = np.random.randint(0, N)
-        dE = delta_energy(spins, i)
-        if dE < 0 or np.random.rand() < np.exp(-beta * dE):
-            spins[i] *= -1
-        if step > burn_in and step % collect_every == 0:
-            all_spins.append(spins)
-
-    return np.array(all_spins)
-
-
-def ising1d_par(N, J, h, beta):
-    """
-    Calculate the partition function Z of the 1D Ising model
-    """
-    configurations = np.array(np.meshgrid(*[[-1, 1]] * N)).T.reshape(-1, N)
-    interaction_energy = -J * np.sum(configurations[:, :-1] * configurations[:, 1:], axis=1)
-    external_field_energy = -h * np.sum(configurations, axis=1)
-    energies = interaction_energy + external_field_energy
-    return np.sum(np.exp(-beta * energies))
-
-
-def ising1d_llh(sigmas, J, h, beta, Z=None):
-    """
-    Compute the log-likelihood of each configuration in the 1D Ising model.
-    sigmas is an M x N matrix of configurations (M configurations, each of length N)
-    Returns log_likelihoods = -beta * H(sigma) - log(Z)
-    """
-    interaction_energy = -J * np.sum(sigmas[:, :-1] * sigmas[:, 1:], axis=1)
-    external_field_energy = -h * np.sum(sigmas, axis=1)
-    energies = interaction_energy + external_field_energy
-    if Z is None:
-        Z = ising1d_par(N=sigmas.shape[1], J=J, h=h, beta=beta)
-    return -beta * energies - np.log(Z)
 
 
 def visualize_ising(S, k_x, k_y):    # Convert to numpy if it's a torch tensor

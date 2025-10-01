@@ -27,27 +27,7 @@ def potts2d_ham(S, J = 1, q = 3):
     equal_down = (S == s_down).int()
     interaction_per_node = (equal_left + equal_right + equal_top + equal_down)
 
-    # Get energy from interaction of neighbors
-    interaction_energy = - J * interaction_per_node.sum(dim = (1,2))/2
-
-    # Get the delta of the energy when flipping the spin 
-    #(Now we need one value for each possible value the spin could flip to)
-    # cat_vec = torch.arange(0, q).to(S.device)
-    # cat_equal_left = (cat_vec[:,None,None] == s_left[None,:,:]).int()
-    # cat_equal_right = (cat_vec[:,None,None] == s_right[None,:,:]).int()
-    # cat_equal_top = (cat_vec[:,None,None] == s_top[None,:,:]).int()
-    # cat_equal_down = (cat_vec[:,None,None] == s_down[None,:,:]).int()
-    # cat_interaction = (cat_equal_left + cat_equal_right + cat_equal_top + cat_equal_down)
-    # interaction_delta_to_neighbor =  - J * (cat_interaction - interaction_per_node[None,:,:])
-
-    # Ignore external field for now
-    ext_field_per_node = 0
-    ext_field_delta_to_neighbor = 0
-    
-    # Get total Hamiltonian
-    H = interaction_energy # + ext_field_per_node
-    # delta_H_to_neighbor = interaction_delta_to_neighbor + ext_field_delta_to_neighbor
-    return H
+    return -J * interaction_per_node.sum(dim = (1,2)) / 2
 
 def potts2d_magnetization_all(S, q):
     # Convert to numpy if it's a torch tensor

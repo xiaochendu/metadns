@@ -7,7 +7,7 @@ from tqdm import tqdm
 import torch.distributed as dist
 
 
-def rnd(model, reward_model, batch_size, scale=1, device='cuda:0'):
+def rnd(model, reward_model, batch_size, device='cuda:0'):
     r"""
     Run random order sampling and compute the RND $\log\frac{dP^*}{dP^u}$ along the trajectory
     reward_model: r(X)
@@ -22,12 +22,8 @@ def rnd(model, reward_model, batch_size, scale=1, device='cuda:0'):
     x = torch.full((batch_size, model.length), model.vocab_size-1).to(device=device, dtype=torch.int64)
     batch_arange = torch.arange(batch_size, device=device)
     jump_pos = torch.rand(x.shape, device=device).argsort(dim=-1)
-    # jump_times, jump_pos = torch.rand(x.shape, device=device).sort(dim=-1)
-    # jump_times: Unif[0,1] in increasing order
-    # jump_pos: random permutation of range(D)
     log_rnd = torch.zeros(batch_size, device=device) # [B]
     for d in range(model.length-1, -1, -1):
-        # jump at time jump_times[:, d] at position jump_pos[:, d]
         logits = model(x)[:, :, :-1] # [B, D, N-1]
         update = sample_categorical_logits(
             logits[batch_arange, jump_pos[:, d]]) # [B]
@@ -35,7 +31,7 @@ def rnd(model, reward_model, batch_size, scale=1, device='cuda:0'):
             x = x.clone()
         x[batch_arange, jump_pos[:, d]] = update
         log_rnd += -np.log(model.vocab_size-1) - logits[batch_arange, jump_pos[:, d], update]
-    log_rnd += scale * reward_model(x) # [B]
+    log_rnd += reward_model(x) # [B]
     return x, log_rnd
 
 
@@ -49,11 +45,7 @@ def sampling(model, batch_size, rounds=1, device='cuda:0'):
     for _ in tqdm(range(rounds), leave=False):
         x = torch.full((batch_size, model.length), model.vocab_size-1).to(device=device, dtype=torch.int64)
         jump_pos = torch.rand(x.shape, device=device).argsort(dim=-1)
-        # jump_times, jump_pos = torch.rand(x.shape, device=device).sort(dim=-1)
-        # jump_times: Unif[0,1] in increasing order
-        # jump_pos: random permutation of range(D)
         for d in tqdm(range(model.length-1, -1, -1), leave=False):
-            # jump at time jump_times[:, d] at position jump_pos[:, d]
             logits = model.logits(x)[:, :, :-1] # [B, D, N-1], not log-softmaxed but fine
             update = sample_categorical_logits(
                 logits[batch_arange, jump_pos[:, d]]) # [B]
@@ -119,7 +111,7 @@ def loss_dce(model, x, weight_func=lambda l: 1/l):
     return - (losses.sum(dim=-1) * lamda_weights).mean()
 
 
-def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=None, scheduler=None,
+def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=None,
           losses=None, ess_train=None, ess_eval=None):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
                'wdce': loss_wdce, 'dce': loss_dce}.get(args.loss_fn)
@@ -152,9 +144,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                     if x_saved is None or epoch % args.resample_every_n_step == 0:
                         ema.store(model.parameters())
                         ema.copy_to(model.parameters())
-                        x, log_rnd = rnd(model, reward_fn, args.batch_size, 
-                                        scale=1,# epoch / args.num_epochs, # TODO
-                                        device=device)
+                        x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
                         ema.restore(model.parameters())
                         x_saved, log_rnd_saved = x, log_rnd
                     else:
@@ -177,7 +167,6 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
         if args.grad_clip:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradnorm_clip)
         optimizer.step()
-        if scheduler is not None: scheduler.step()
         if ema is not None: ema.update(model.parameters())
         
         pbar.set_postfix(loss=info['loss'], ess=info['ess_train'])
@@ -233,9 +222,7 @@ def train_ddp(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema
                     if x_saved is None or epoch % args.resample_every_n_step == 0:
                         ema.store(model.parameters())
                         ema.copy_to(model.parameters())
-                        x, log_rnd = rnd(model, reward_fn, args.batch_size, 
-                                        scale=1,# epoch / args.num_epochs, # TODO
-                                        device=device)
+                        x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
                         ema.restore(model.parameters())
                         x_saved, log_rnd_saved = x, log_rnd
                     else:
