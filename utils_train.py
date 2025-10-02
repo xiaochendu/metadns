@@ -1,7 +1,6 @@
 import random
 import torch
-from torch.utils.data import DataLoader, TensorDataset
-from utils import ess, sample_categorical_logits, cycleloader
+from utils import ess, sample_categorical_logits
 import numpy as np
 from tqdm import tqdm
 import torch.distributed as dist
@@ -114,15 +113,9 @@ def loss_dce(model, x, weight_func=lambda l: 1/l):
 def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=None,
           losses=None, ess_train=None, ess_eval=None):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
-               'wdce': loss_wdce, 'dce': loss_dce}.get(args.loss_fn)
+               'wdce': loss_wdce}.get(args.loss_fn)
     if loss_fn is None:
         raise ValueError(f"Unknown loss function: {args.loss_fn}")
-    if args.loss_fn == 'dce': # load ground truth samples
-        mh_samps = np.load(f'exp_local/samples{int(model.module.length**.5)}x{int(model.module.length**.5)}.npy') # {-1, 1}
-        mh_samps = torch.from_numpy(mh_samps).to(device)
-        dataset = TensorDataset((1 + mh_samps) // 2) # {0, 1}
-        dataloader = cycleloader(
-            DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True))
 
     # continue recording the metrics from the last training
     losses = [] if losses is None else losses.copy()
@@ -136,25 +129,23 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
     
     for epoch in pbar:
         model.train(); optimizer.zero_grad(); info = {}
-        if args.loss_fn == 'dce':
-            loss = loss_dce(model, next(dataloader)[0])
-        else:
-            if args.loss_fn == 'wdce':
-                with torch.no_grad():
-                    if x_saved is None or epoch % args.resample_every_n_step == 0:
-                        ema.store(model.parameters())
-                        ema.copy_to(model.parameters())
-                        x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
-                        ema.restore(model.parameters())
-                        x_saved, log_rnd_saved = x, log_rnd
-                    else:
-                        x, log_rnd = x_saved, log_rnd_saved
 
-                loss = loss_wdce(model, log_rnd, x,
-                                 num_replicates=args.wdce_num_replicates)
-            else:
-                x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
-                loss = loss_fn(log_rnd)
+        if args.loss_fn == 'wdce':
+            with torch.no_grad():
+                if x_saved is None or epoch % args.resample_every_n_step == 0:
+                    ema.store(model.parameters())
+                    ema.copy_to(model.parameters())
+                    x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
+                    ema.restore(model.parameters())
+                    x_saved, log_rnd_saved = x, log_rnd
+                else:
+                    x, log_rnd = x_saved, log_rnd_saved
+
+            loss = loss_wdce(model, log_rnd, x,
+                                num_replicates=args.wdce_num_replicates)
+        else:
+            x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
+            loss = loss_fn(log_rnd)
                 
         # Synchronize loss across processes
         
@@ -186,15 +177,9 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
 def train_ddp(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=None, scheduler=None,
           losses=None, ess_train=None, ess_eval=None):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
-               'wdce': loss_wdce, 'dce': loss_dce}.get(args.loss_fn)
+               'wdce': loss_wdce}.get(args.loss_fn)
     if loss_fn is None:
         raise ValueError(f"Unknown loss function: {args.loss_fn}")
-    if args.loss_fn == 'dce': # load ground truth samples
-        mh_samps = np.load(f'exp_local/samples{int(model.module.length**.5)}x{int(model.module.length**.5)}.npy') # {-1, 1}
-        mh_samps = torch.from_numpy(mh_samps).to(device)
-        dataset = TensorDataset((1 + mh_samps) // 2) # {0, 1}
-        dataloader = cycleloader(
-            DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True))
 
     # continue recording the metrics from the last training
     losses = [] if losses is None else losses.copy()
@@ -214,25 +199,23 @@ def train_ddp(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema
     
     for epoch in pbar:
         model.train(); optimizer.zero_grad(); info = {}
-        if args.loss_fn == 'dce':
-            loss = loss_dce(model, next(dataloader)[0])
-        else:
-            if args.loss_fn == 'wdce':
-                with torch.no_grad():
-                    if x_saved is None or epoch % args.resample_every_n_step == 0:
-                        ema.store(model.parameters())
-                        ema.copy_to(model.parameters())
-                        x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
-                        ema.restore(model.parameters())
-                        x_saved, log_rnd_saved = x, log_rnd
-                    else:
-                        x, log_rnd = x_saved, log_rnd_saved
 
-                loss = loss_wdce(model, log_rnd, x,
-                                 num_replicates=args.wdce_num_replicates)
-            else:
-                x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
-                loss = loss_fn(log_rnd)
+        if args.loss_fn == 'wdce':
+            with torch.no_grad():
+                if x_saved is None or epoch % args.resample_every_n_step == 0:
+                    ema.store(model.parameters())
+                    ema.copy_to(model.parameters())
+                    x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
+                    ema.restore(model.parameters())
+                    x_saved, log_rnd_saved = x, log_rnd
+                else:
+                    x, log_rnd = x_saved, log_rnd_saved
+
+            loss = loss_wdce(model, log_rnd, x,
+                                num_replicates=args.wdce_num_replicates)
+        else:
+            x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
+            loss = loss_fn(log_rnd)
                 
         # Synchronize loss across processes
         dist.all_reduce(loss)
