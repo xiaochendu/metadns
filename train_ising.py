@@ -1,15 +1,21 @@
-import torch
-from model import get_rope_vit_model, ExponentialMovingAverage
-from utils import Dict2Obj, plot_loss_ess
-from utils_train import train
-from utils_ising import ising2d_ham
 from warnings import simplefilter
+
 import matplotlib.pyplot as plt
+import torch
+
+from model import ExponentialMovingAverage, get_rope_vit_model
+from utils import Dict2Obj, plot_loss_ess
+from utils_ising import ising2d_ham
+from utils_train import train
+
 simplefilter(action='ignore', category=FutureWarning)
-import os
 import argparse
-from pprint import pformat
 import json
+import os
+from pathlib import Path
+from pprint import pformat
+
+import wandb
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--device', type=str, default="cuda:0")
@@ -22,6 +28,11 @@ parser.add_argument('--use_anneal', action='store_true')
 parser.add_argument('--anneal_beta', type=float, default=None)
 parser.add_argument('--anneal_epochs', type=int, default=None)
 parser.add_argument('--resume_from_ckpt', type=str, default=None)
+parser.add_argument('--wandb', dest='use_wandb', action='store_true', help="Enable wandb logging")
+parser.add_argument('--no-wandb', dest='use_wandb', action='store_false', help="Disable wandb logging")
+parser.set_defaults(use_wandb=False)
+parser.add_argument('--wandb_project', type=str, default='mdns-ising', help="wandb project name")
+parser.add_argument('--wandb_run_name', type=str, default=None, help="wandb run name")
 args = parser.parse_args()
 
 if args.use_anneal:
@@ -36,8 +47,8 @@ J = args.J
 h = 0
 resume_path = args.resume_from_ckpt
 anneal_beta = args.anneal_beta
-dir_name = f'exp_local/L_{L}_ising_beta_{beta}_J_{J}/{args.dir_name}'
-os.makedirs(dir_name, exist_ok=True)
+dir_name = Path(args.dir_name)
+dir_name.mkdir(parents=True, exist_ok=True)
 
 def reward_fn_ising(S, beta=0.28, J=1, h=0): 
     return -beta * ising2d_ham(2*S-1, J, h)
@@ -61,6 +72,15 @@ cfg = {'tokens': 2,
        'loss_fn': 'wdce',
        'wdce_num_replicates': 8,
        'seed': None}
+
+wandb_run = None
+if args.use_wandb:
+    wandb_run = wandb.init(
+        project=args.wandb_project,
+        name=args.wandb_run_name or args.dir_name,
+        dir=args.dir_name,
+        config=cfg,
+    )
 
 model = get_rope_vit_model(L, embed_dim=cfg['model']['hidden_size'], 
                           depth=cfg['model']['n_blocks'], 
@@ -98,7 +118,8 @@ if not args.use_anneal:
     model, optimizer, ema, losses, ess_train, ess_eval = train(
         model, optimizer, lambda x: reward_fn_ising(x, beta=beta, J=J, h=h), 
         Dict2Obj(cfg), device, ema=ema, num_epochs=args.num_epochs,
-        losses=losses, ess_train=ess_train, ess_eval=ess_eval)
+        losses=losses, ess_train=ess_train, ess_eval=ess_eval,
+        wandb_run=wandb_run, L=L)
     
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")
@@ -113,7 +134,8 @@ else:
     model.train()
     model, optimizer, ema, losses, ess_train, ess_eval = train(
             model, optimizer, lambda x: reward_fn_ising(x, beta=args.anneal_beta, J=J, h=h), 
-            Dict2Obj(cfg), device, num_epochs=args.anneal_epochs, ema=ema)
+            Dict2Obj(cfg), device, num_epochs=args.anneal_epochs, ema=ema,
+            wandb_run=wandb_run, L=L)
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess_anneal.png")
     torch.save({
@@ -127,7 +149,8 @@ else:
     model, optimizer, ema, losses, ess_train, ess_eval = train(
         model, optimizer, lambda x: reward_fn_ising(x, beta=beta, J=J, h=h), 
         Dict2Obj(cfg), device, num_epochs=args.num_epochs, 
-        ema=ema, losses=losses, ess_train=ess_train, ess_eval=ess_eval)
+        ema=ema, losses=losses, ess_train=ess_train, ess_eval=ess_eval,
+        wandb_run=wandb_run, L=L)
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")
     torch.save({
@@ -137,3 +160,6 @@ else:
         'losses': losses, 'ess_train': ess_train, 
         'ess_eval': ess_eval,
         'cfg': cfg}, f'{dir_name}/weights_final.pth')
+
+if wandb_run is not None:
+    wandb_run.finish()

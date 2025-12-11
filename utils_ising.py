@@ -5,11 +5,11 @@ Please be aware of the input shape and range before use!
 """
 
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from tqdm import tqdm
 from matplotlib.colors import ListedColormap
-import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 
 def ising2d_ham(S, J=1.0, h=0.0):

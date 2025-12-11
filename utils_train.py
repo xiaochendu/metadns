@@ -1,9 +1,14 @@
 import random
-import torch
-from utils import ess, sample_categorical_logits
+
+import matplotlib.pyplot as plt
 import numpy as np
-from tqdm import tqdm
+import torch
 import torch.distributed as dist
+import wandb
+from matplotlib.colors import ListedColormap
+from tqdm import tqdm
+
+from utils import ess, sample_categorical_logits
 
 
 def rnd(model, reward_model, batch_size, device='cuda:0'):
@@ -110,8 +115,66 @@ def loss_dce(model, x, weight_func=lambda l: 1/l):
     return - (losses.sum(dim=-1) * lamda_weights).mean()
 
 
+def _compute_log_stats(x, log_rnd, reward_fn, model):
+    """Compute logf_t and logp_x given samples and RND values."""
+    logf_t_vals = reward_fn(x)  # reward_fn already returns logf_t
+    num_states = getattr(model, "vocab_size", 3) - 1  # exclude mask token
+    data_dim = x.shape[1]
+    uniform_prior_term = -torch.log(torch.tensor(float(num_states), device=x.device))
+    uniform_prior_total = uniform_prior_term * data_dim
+    logp_x_vals = uniform_prior_total + logf_t_vals - log_rnd
+    return logf_t_vals, logp_x_vals
+
+
+def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16):
+    """Visualize Ising lattices in a grid.
+    
+    Args:
+        samples: Tensor of shape [B, L*L] or [B, L, L]
+        L: Lattice dimension
+        n_rows: Number of rows in grid
+        n_cols: Number of columns in grid
+        max_samples: Maximum number of samples to visualize
+    """
+    # Reshape if needed: [B, L*L] -> [B, L, L]
+    if samples.ndim == 2:
+        B = samples.shape[0]
+        samples = samples.view(B, L, L)
+    
+    # Convert to float and CPU for matplotlib
+    samples = samples.float().cpu()
+    
+    # Limit number of samples
+    n_plots = min(n_rows * n_cols, max_samples, samples.shape[0])
+    samples_to_plot = samples[:n_plots]
+    
+    # Create colormap for binary Ising (blue for 0, pink for 1)
+    palette = ["#1f77b4", "#e377c2"]
+    cmap = ListedColormap(palette)
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 1.5, n_rows * 1.5))
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    elif n_cols == 1:
+        axes = axes.reshape(-1, 1)
+    axes = axes.flatten()
+    
+    for i in range(n_plots):
+        ax = axes[i]
+        sample_np = samples_to_plot[i].numpy()
+        ax.imshow(sample_np, cmap=cmap, origin="lower", vmin=0, vmax=1)
+        ax.axis("off")
+    
+    # Hide unused subplots
+    for i in range(n_plots, len(axes)):
+        axes[i].axis("off")
+    
+    plt.tight_layout()
+    return fig
+
+
 def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=None,
-          losses=None, ess_train=None, ess_eval=None):
+          losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
                'wdce': loss_wdce}.get(args.loss_fn)
     if loss_fn is None:
@@ -149,10 +212,35 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                 
         # Synchronize loss across processes
         
+        logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model)
+        vfe = logp_x_vals - logf_t_vals  # variational free energy
         ess_train.append(ess(log_rnd))
         info['ess_train'] = ess_train[-1]
         info['loss'] = loss.item()
         losses.append(loss.item())
+
+        if wandb_run is not None:
+            log_dict = {
+                "train/loss": loss.item(),
+                "train/avg_free_energy": vfe.mean().item(),
+                "train/std_free_energy": vfe.std().item(),
+                "train/avg_logp_x": logp_x_vals.mean().item(),
+                "train/std_logp_x": logp_x_vals.std().item(),
+                "train/avg_logf_t": logf_t_vals.mean().item(),
+                "train/std_logf_t": logf_t_vals.std().item(),
+            }
+            
+            # Log lattice visualization periodically (every 100 epochs)
+            if L is not None and epoch % 100 == 0:
+                try:
+                    fig = _visualize_lattices(x, L, n_rows=2, n_cols=5, max_samples=10)
+                    log_dict["train/samples"] = wandb.Image(fig)
+                    plt.close(fig)
+                except Exception as e:
+                    # Silently skip visualization if there's an error
+                    pass
+            
+            wandb_run.log(log_dict, step=epoch)
         
         loss.backward()
         if args.grad_clip:
@@ -169,6 +257,30 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                 x, log_rnd = rnd(model, reward_fn, args.eval_batch_size, device=device)
                 eval_ess = ess(log_rnd)
                 ess_eval.append(eval_ess)
+                if wandb_run is not None:
+                    logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model)
+                    vfe = logp_x_vals - logf_t_vals  # variational free energy
+                    log_dict = {
+                        "val/avg_free_energy": vfe.mean().item(),
+                        "val/std_free_energy": vfe.std().item(),
+                        "val/avg_logp_x": logp_x_vals.mean().item(),
+                        "val/std_logp_x": logp_x_vals.std().item(),
+                        "val/avg_logf_t": logf_t_vals.mean().item(),
+                        "val/std_logf_t": logf_t_vals.std().item(),
+                        "val/ess": eval_ess,
+                    }
+                    
+                    # Log lattice visualization during evaluation
+                    if L is not None:
+                        try:
+                            fig = _visualize_lattices(x, L, n_rows=2, n_cols=5, max_samples=10)
+                            log_dict["val/samples"] = wandb.Image(fig)
+                            plt.close(fig)
+                        except Exception as e:
+                            # Silently skip visualization if there's an error
+                            pass
+                    
+                    wandb_run.log(log_dict, step=epoch)
             model.train()
             
     return model, optimizer, ema, losses, ess_train, ess_eval
