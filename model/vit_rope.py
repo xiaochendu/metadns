@@ -10,18 +10,89 @@ Copyright (c) Meta Platforms, Inc. and affiliates.
 
 All rights reserved.
 """
-import torch
-import torch.nn as nn
+import math
 from functools import partial
 
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
-
-from timm.models.vision_transformer import Mlp, PatchEmbed , _cfg
-
 from timm.layers import DropPath, to_2tuple, trunc_normal_
 from timm.models import register_model
+from timm.models.vision_transformer import Mlp, PatchEmbed, _cfg
 
-from .vit import vit_models, Layer_scale_init_Block, Attention
+from .vit import Attention, Layer_scale_init_Block, vit_models
+
+
+class ThermodynamicEmbedder(nn.Module):
+    """Embeds scalar thermodynamic quantities using sinusoidal frequency embeddings.
+    
+    Similar to positional encodings, but for continuous scalar values like temperature
+    and magnetic field. Uses sinusoidal embeddings which are better for continuous
+    values than simple linear layers.
+    """
+    
+    def __init__(
+        self,
+        hidden_size: int,
+        frequency_embedding_size: int = 256,
+        use_mlp: bool = False,
+    ):
+        """Initialize the embedder.
+        
+        Args:
+            hidden_size: Output embedding dimension
+            frequency_embedding_size: Dimension of sinusoidal embeddings
+            use_mlp: Whether to use MLP on top of frequency embeddings
+        """
+        super().__init__()
+        self.use_mlp = use_mlp
+        self.frequency_embedding_size = frequency_embedding_size
+        
+        if self.use_mlp:
+            self.mlp = nn.Sequential(
+                nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size, bias=True),
+            )
+        else:
+            assert frequency_embedding_size == hidden_size, \
+                "frequency_embedding_size must equal hidden_size when use_mlp=False"
+    
+    @staticmethod
+    def embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+        """Create sinusoidal embeddings.
+        
+        Args:
+            t: Input scalars [B]
+            dim: Output embedding dimension
+            max_period: Controls the minimum frequency of the embeddings
+        
+        Returns:
+            Embeddings [B, dim]
+        """
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period)
+            * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device)
+            / half
+        )
+        args = t[:, None].float() * freqs[None]  # (B, D/2)
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # (B, D)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+    
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+        
+        Args:
+            t: Input scalars [B]
+        
+        Returns:
+            Embeddings [B, hidden_size]
+        """
+        t_freq = self.embedding(t, self.frequency_embedding_size)
+        return self.mlp(t_freq) if self.use_mlp else t_freq
 
 def init_random_2d_freqs(dim: int, num_heads: int, theta: float = 10.0, rotate: bool = True):
     freqs_x = []
@@ -201,16 +272,57 @@ class RopeVIT(vit_models):
                       'float32': torch.float32,
                       'float16': torch.float16,
                       'bfloat16': torch.bfloat16}.get(dtype, torch.float16)
+        
+        # Thermodynamic conditioning (temperature and field)
+        # Match snowyflow's approach: separate embedders, concatenate embeddings
+        # Each gets embed_dim // 4, concatenated gives embed_dim // 2, then we project to embed_dim
+        self.thermo_embed_dim = embed_dim // 4  # Can be made configurable
+        self.beta_embedder = ThermodynamicEmbedder(
+            hidden_size=self.thermo_embed_dim,
+            frequency_embedding_size=embed_dim // 2,
+            use_mlp=True,  # Use MLP for better expressiveness
+        )
+        self.h_embedder = ThermodynamicEmbedder(
+            hidden_size=self.thermo_embed_dim,
+            frequency_embedding_size=embed_dim // 2,
+            use_mlp=True,
+        )
+        # Project concatenated embeddings to full embed_dim for addition
+        # Concatenated: [B, thermo_embed_dim * 2] = [B, embed_dim // 2] -> [B, embed_dim]
+        self.thermo_proj = nn.Linear(self.thermo_embed_dim * 2, embed_dim)
 
 
     @torch.jit.ignore
     def no_weight_decay(self):
-        return {'pos_embed', 'cls_token', 'freqs'}
+        return {'pos_embed', 'cls_token', 'freqs', 'beta_embedder', 'h_embedder', 'thermo_proj'}
         
-    def forward_features(self, x):
+    def forward_features(self, x, beta=None, h=None):
         B = x.shape[0]; H = W = int(x.shape[1] ** 0.5)
         # x = self.patch_embed(x) # we don't use patch embedding, but use vocab embedding instead
         x = self.vocab_embed(x) # [B, D, embed_dim]
+
+        # Add thermodynamic conditioning if provided
+        # Concatenate beta and h embeddings, then project (similar to snowyflow)
+        if beta is not None or h is not None:
+            # Convert beta to temperature for embedding (beta = 1/T, so T = 1/beta)
+            if beta is not None:
+                temp = 1.0 / beta  # [B]
+                beta_emb = self.beta_embedder(temp)  # [B, thermo_embed_dim]
+            else:
+                # If beta not provided, use zeros (for backward compatibility)
+                beta_emb = torch.zeros(x.shape[0], self.thermo_embed_dim, device=x.device, dtype=x.dtype)
+            
+            if h is not None:
+                h_emb = self.h_embedder(h)  # [B, thermo_embed_dim]
+            else:
+                # If h not provided, use zeros (for backward compatibility)
+                h_emb = torch.zeros(x.shape[0], self.thermo_embed_dim, device=x.device, dtype=x.dtype)
+            
+            # Concatenate embeddings and project to full embed_dim
+            combined_emb = torch.cat([beta_emb, h_emb], dim=-1)  # [B, thermo_embed_dim * 2]
+            combined_emb = self.thermo_proj(combined_emb)  # [B, embed_dim]
+            combined_emb = combined_emb.unsqueeze(1).expand(-1, x.shape[1], -1)  # [B, D, embed_dim]
+            x = x + combined_emb
 
         cls_tokens = self.cls_token.expand(B, -1, -1)
 
@@ -253,19 +365,21 @@ class RopeVIT(vit_models):
         x = self.norm(x)
         return x
     
-    def logits(self, x):
+    def logits(self, x, beta=None, h=None):
         """
         input: x: [B, D], values in range(N) or [B, D, N], last dimension sums to 1
+               beta: [B] tensor of inverse temperatures (optional)
+               h: [B] tensor of field values (optional)
         output: logits [B, D, N] (not log-softmaxed for non-mask positions)
         """
         with torch.amp.autocast('cuda', dtype=self.dtype):
-            x = self.forward_features(x) # [B, embed_dim]
+            x = self.forward_features(x, beta=beta, h=h) # [B, embed_dim]
             x = self.head(x)
             # [B, D * N] -> [B, D, N]
         return x[:, 1:, :]
     
-    def forward(self, x):
-        x = self.logits(x)
+    def forward(self, x, beta=None, h=None):
+        x = self.logits(x, beta=beta, h=h)
         x[:, :, :-1] = x[:, :, :-1].log_softmax(dim=-1)
         return x
 

@@ -1,4 +1,5 @@
 import random
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,14 +12,22 @@ from tqdm import tqdm
 from utils import ess, sample_categorical_logits
 
 
-def rnd(model, reward_model, batch_size, device='cuda:0'):
+def rnd(model, reward_model, batch_size, device='cuda:0', beta_batch=None, h_batch=None, J=1):
     r"""
     Run random order sampling and compute the RND $\log\frac{dP^*}{dP^u}$ along the trajectory
-    reward_model: r(X)
-
-    return:
-    - x: the final samples, [B, D]
-    - log_rnd: the log RND along this trajectory, [B]
+    
+    Args:
+        model: The model
+        reward_model: Function that takes (x, beta, J, h) and returns rewards [B]
+        batch_size: Batch size
+        device: Device
+        beta_batch: [B] tensor of beta values, or None for single beta (backward compatible)
+        h_batch: [B] tensor of field values, or None for single field (backward compatible)
+        J: Scalar interaction strength
+        
+    Returns:
+        x: the final samples, [B, D]
+        log_rnd: the log RND along this trajectory, [B]
     """
     if hasattr(model, 'module'):
         model = model.module
@@ -28,14 +37,30 @@ def rnd(model, reward_model, batch_size, device='cuda:0'):
     jump_pos = torch.rand(x.shape, device=device).argsort(dim=-1)
     log_rnd = torch.zeros(batch_size, device=device) # [B]
     for d in range(model.length-1, -1, -1):
-        logits = model(x)[:, :, :-1] # [B, D, N-1]
+        # Pass beta and h to model if provided
+        if beta_batch is not None or h_batch is not None:
+            logits = model(x, beta=beta_batch, h=h_batch)[:, :, :-1] # [B, D, N-1]
+        else:
+            logits = model(x)[:, :, :-1] # [B, D, N-1] - backward compatible
         update = sample_categorical_logits(
             logits[batch_arange, jump_pos[:, d]]) # [B]
         if torch.is_grad_enabled(): # avoid issues with in-place operations
             x = x.clone()
         x[batch_arange, jump_pos[:, d]] = update
         log_rnd += -np.log(model.vocab_size-1) - logits[batch_arange, jump_pos[:, d], update]
-    log_rnd += reward_model(x) # [B]
+    
+    # Compute reward with per-sample temperatures/fields if provided
+    if beta_batch is not None or h_batch is not None:
+        # Ensure tensors are on correct device
+        if beta_batch is not None and isinstance(beta_batch, torch.Tensor):
+            beta_batch = beta_batch.to(device)
+        if h_batch is not None and isinstance(h_batch, torch.Tensor):
+            h_batch = h_batch.to(device)
+        log_rnd += reward_model(x, beta=beta_batch, h=h_batch if h_batch is not None else 0, J=J)
+    else:
+        # Backward compatible: use default scalar values
+        log_rnd += reward_model(x) # [B]
+    
     return x, log_rnd
 
 
@@ -74,7 +99,7 @@ def loss_re_rf(log_rnd, const=0):
     return (-log_rnd * (-log_rnd.detach() + const)).mean()
 
 
-def loss_wdce(model, log_rnd, x, num_replicates=16, weight_func=lambda l: 1/l):
+def loss_wdce(model, log_rnd, x, num_replicates=16, weight_func=lambda l: 1/l, beta_batch=None, h_batch=None):
     r"""
     Weighted denoising cross entropy loss
     X_T ~ P^u_T and weights \log\frac{dP^*}{dP^u}(X)
@@ -82,6 +107,8 @@ def loss_wdce(model, log_rnd, x, num_replicates=16, weight_func=lambda l: 1/l):
     log_rnd: [B]; x: [B, D] (no mask)
     num_replicates: R, number of replicates of each row in x
     weight_func: w(lambda) for each sample, 1/lambda by default
+    beta_batch: [B] tensor of beta values (optional, for conditioning)
+    h_batch: [B] tensor of field values (optional, for conditioning)
     """
     if hasattr(model, 'module'):
         model = model.module
@@ -92,32 +119,159 @@ def loss_wdce(model, log_rnd, x, num_replicates=16, weight_func=lambda l: 1/l):
     lamda_weights = weight_func(lamda).clamp(max=1e5) # [B*R]
     masked_index = torch.rand(*batch.shape, device=batch.device) < lamda[..., None] # [B*R, D]
     perturbed_batch = torch.where(masked_index, model.vocab_size-1, batch)
-    logits = model(perturbed_batch)
+    
+    # Handle beta/h conditioning - replicate them to match perturbed_batch
+    if beta_batch is not None or h_batch is not None:
+        beta_perturbed = beta_batch.repeat_interleave(num_replicates, dim=0) if beta_batch is not None else None
+        h_perturbed = h_batch.repeat_interleave(num_replicates, dim=0) if h_batch is not None else None
+        logits = model(perturbed_batch, beta=beta_perturbed, h=h_perturbed)
+    else:
+        logits = model(perturbed_batch)  # Backward compatible
+    
     losses = torch.zeros(*batch.shape, device=batch.device, dtype=logits.dtype) # [B*R, D]
     losses[masked_index] = torch.gather(input=logits[masked_index], dim=-1,
                                         index=batch[masked_index][..., None]).squeeze(-1)
     return - (losses.sum(dim=-1) * lamda_weights * batch_weights).mean()
 
 
-def loss_dce(model, x, weight_func=lambda l: 1/l):
+def loss_dce(model, x, weight_func=lambda l: 1/l, beta_batch=None, h_batch=None):
     r"""
     Denoising cross entropy loss, x [B, D] are ground truth samples
     weight_func: w(lambda) for each sample, 1/lambda by default
+    beta_batch: [B] tensor of beta values (optional, for conditioning)
+    h_batch: [B] tensor of field values (optional, for conditioning)
     """
     lamda = torch.rand(x.shape[0], device=x.device) # [B]
     lamda_weights = weight_func(lamda).clamp(max=1e5) # [B]
     masked_index = torch.rand(*x.shape, device=x.device) < lamda[..., None] # [B, D]
     perturbed_batch = torch.where(masked_index, model.vocab_size-1, x)
-    logits = model(perturbed_batch)
+    
+    # Handle beta/h conditioning
+    if beta_batch is not None or h_batch is not None:
+        logits = model(perturbed_batch, beta=beta_batch, h=h_batch)
+    else:
+        logits = model(perturbed_batch)  # Backward compatible
+    
     losses = torch.zeros(*x.shape, device=x.device, dtype=logits.dtype) # [B, D]
     losses[masked_index] = torch.gather(input=logits[masked_index], dim=-1,
                                         index=x[masked_index][..., None]).squeeze(-1)
     return - (losses.sum(dim=-1) * lamda_weights).mean()
 
 
-def _compute_log_stats(x, log_rnd, reward_fn, model):
-    """Compute logf_t and logp_x given samples and RND values."""
-    logf_t_vals = reward_fn(x)  # reward_fn already returns logf_t
+def log_validation_metrics(
+    wandb_run,
+    logp_x: torch.Tensor,
+    logf_t: torch.Tensor,
+    vfe: torch.Tensor,
+    beta_batch: Optional[torch.Tensor],
+    h_batch: Optional[torch.Tensor],
+    step: int,
+    log_kwargs: Optional[dict] = None,
+) -> None:
+    """Log validation metrics per condition and overall, similar to snowyflow.
+    
+    Args:
+        wandb_run: Wandb run object for logging
+        logp_x: Log probability of data under model, shape [B]
+        logf_t: Log forward probability from MDNS, shape [B]
+        vfe: Variational free energy (logp_x - logf_t), shape [B]
+        beta_batch: Beta values [B] or None for single condition
+        h_batch: Field values [B] or None for single condition
+        step: Step/epoch number for logging
+        log_kwargs: Additional keyword arguments to pass to wandb.log
+    """
+    if log_kwargs is None:
+        log_kwargs = {}
+    
+    # Extract temperature and field batches (use defaults if None)
+    batch_size = logf_t.shape[0]
+    if beta_batch is not None:
+        temp_batch = 1.0 / beta_batch.cpu().numpy()  # [B]
+    else:
+        temp_batch = np.zeros(batch_size)  # Default: single temp (will be 0.0)
+    
+    if h_batch is not None:
+        field_batch = h_batch.cpu().numpy()  # [B]
+    else:
+        field_batch = np.zeros(batch_size)  # Default: single field (will be 0.0)
+    
+    # Get unique temperature/field combinations
+    conditions = list(zip(temp_batch, field_batch))
+    unique_conditions = sorted(set(conditions))
+    
+    # Separate dictionaries for main val panel and conditions panel
+    val_log_data = {}  # Overall metrics for main val panel
+    conditions_log_data = {}  # Per-condition metrics for separate panel
+    
+    # Group metrics by condition
+    for temp_val, field_val in unique_conditions:
+        condition_name = f"T{temp_val:04.0f}_F{field_val:+.3f}"
+        
+        # Find indices for this condition
+        mask = np.array([(t == temp_val and f == field_val) for t, f in conditions])
+        
+        # Extract metrics for this condition
+        logf_t_cond = logf_t[mask]
+        logp_x_cond = logp_x[mask]
+        vfe_cond = vfe[mask]
+        
+        # Log per-condition metrics to separate panel (val_conditions/)
+        conditions_log_data[f"logf_t_mean/{condition_name}"] = logf_t_cond.mean().item()
+        conditions_log_data[f"logf_t_std/{condition_name}"] = logf_t_cond.std().item()
+        conditions_log_data[f"logp_x_mean/{condition_name}"] = logp_x_cond.mean().item()
+        conditions_log_data[f"logp_x_std/{condition_name}"] = logp_x_cond.std().item()
+        conditions_log_data[f"vfe_mean/{condition_name}"] = vfe_cond.mean().item()
+        conditions_log_data[f"vfe_std/{condition_name}"] = vfe_cond.std().item()
+    
+    # Log temperature and field statistics to conditions panel (only if they vary)
+    if beta_batch is not None:
+        conditions_log_data["temp/min"] = float(temp_batch.min())
+        conditions_log_data["temp/max"] = float(temp_batch.max())
+        conditions_log_data["temp/mean"] = float(temp_batch.mean())
+        conditions_log_data["temp/std"] = float(temp_batch.std())
+    
+    if h_batch is not None:
+        conditions_log_data["field/min"] = float(field_batch.min())
+        conditions_log_data["field/max"] = float(field_batch.max())
+        conditions_log_data["field/mean"] = float(field_batch.mean())
+        conditions_log_data["field/std"] = float(field_batch.std())
+    
+    # Add overall statistics to main val panel (always log these)
+    val_log_data["logf_t_mean/overall"] = logf_t.mean().item()
+    val_log_data["logf_t_std/overall"] = logf_t.std().item()
+    val_log_data["logp_x_mean/overall"] = logp_x.mean().item()
+    val_log_data["logp_x_std/overall"] = logp_x.std().item()
+    val_log_data["vfe_mean/overall"] = vfe.mean().item()
+    val_log_data["vfe_std/overall"] = vfe.std().item()
+    
+    # Prefix keys appropriately for separate panels
+    val_log_data_prefixed = {f"val/{k}": v for k, v in val_log_data.items()}
+    conditions_log_data_prefixed = {f"val_conditions/{k}": v for k, v in conditions_log_data.items()}
+    
+    # Log to separate panels
+    wandb_run.log(val_log_data_prefixed, step=step, **log_kwargs)
+    if conditions_log_data_prefixed:  # Only log if there are per-condition metrics
+        wandb_run.log(conditions_log_data_prefixed, step=step, **log_kwargs)
+
+
+def _compute_log_stats(x, log_rnd, reward_fn, model, beta_batch=None, h_batch=None, J=1):
+    """Compute logf_t and logp_x given samples and RND values.
+    
+    Args:
+        x: [B, D] samples
+        log_rnd: [B] log RND values
+        reward_fn: Function that takes (x, beta, J, h) and returns rewards
+        model: Model (for getting vocab_size)
+        beta_batch: [B] tensor of beta values, or None for scalar beta
+        h_batch: [B] tensor of field values, or None for scalar field
+        J: Scalar interaction strength
+    """
+    # Compute logf_t using per-sample betas/fields if provided
+    if beta_batch is not None or h_batch is not None:
+        logf_t_vals = reward_fn(x, beta=beta_batch, h=h_batch if h_batch is not None else 0, J=J)
+    else:
+        logf_t_vals = reward_fn(x)  # Use default scalar values
+    
     num_states = getattr(model, "vocab_size", 3) - 1  # exclude mask token
     data_dim = x.shape[1]
     uniform_prior_term = -torch.log(torch.tensor(float(num_states), device=x.device))
@@ -126,7 +280,8 @@ def _compute_log_stats(x, log_rnd, reward_fn, model):
     return logf_t_vals, logp_x_vals
 
 
-def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16):
+def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16, 
+                        beta_batch=None, h_batch=None):
     """Visualize Ising lattices in a grid.
     
     Args:
@@ -135,6 +290,8 @@ def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16):
         n_rows: Number of rows in grid
         n_cols: Number of columns in grid
         max_samples: Maximum number of samples to visualize
+        beta_batch: [B] tensor of beta values (optional, for sampling from each temp)
+        h_batch: [B] tensor of field values (optional, for sampling from each field)
     """
     # Reshape if needed: [B, L*L] -> [B, L, L]
     if samples.ndim == 2:
@@ -144,9 +301,48 @@ def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16):
     # Convert to float and CPU for matplotlib
     samples = samples.float().cpu()
     
-    # Limit number of samples
-    n_plots = min(n_rows * n_cols, max_samples, samples.shape[0])
-    samples_to_plot = samples[:n_plots]
+    # If beta_batch and h_batch are provided, sample from each unique temp/field combination
+    if beta_batch is not None and h_batch is not None:
+        # Convert beta to temperature for grouping
+        temp_batch = 1.0 / beta_batch.cpu().numpy()
+        h_batch_cpu = h_batch.cpu().numpy()
+        
+        # Find unique temp/field combinations
+        # Round to avoid floating point precision issues
+        temp_rounded = np.round(temp_batch, decimals=4)
+        h_rounded = np.round(h_batch_cpu, decimals=4)
+        
+        # Create combination keys
+        combinations = [(t, h) for t, h in zip(temp_rounded, h_rounded)]
+        unique_combos = list(set(combinations))
+        
+        # Sample at least a few samples from each combination
+        samples_to_plot_indices = []
+        samples_per_combo = max(1, max_samples // max(len(unique_combos), 1))
+        
+        for combo in unique_combos:
+            # Find indices matching this combination
+            matching_indices = np.array([i for i, c in enumerate(combinations) if c == combo])
+            # Sample up to samples_per_combo from this combination
+            n_samples_from_combo = min(samples_per_combo, len(matching_indices))
+            if n_samples_from_combo > 0:
+                if len(matching_indices) == 1:
+                    # Only one matching index, just use it
+                    selected_indices = matching_indices
+                else:
+                    selected_indices = np.random.choice(
+                        matching_indices, size=n_samples_from_combo, replace=False
+                    )
+                samples_to_plot_indices.extend(selected_indices.tolist())
+        
+        # Limit total number of samples
+        n_plots = min(n_rows * n_cols, len(samples_to_plot_indices), max_samples)
+        samples_to_plot_indices = samples_to_plot_indices[:n_plots]
+        samples_to_plot = samples[samples_to_plot_indices]
+    else:
+        # Original behavior: just take first N samples
+        n_plots = min(n_rows * n_cols, max_samples, samples.shape[0])
+        samples_to_plot = samples[:n_plots]
     
     # Create colormap for binary Ising (blue for 0, pink for 1)
     palette = ["#1f77b4", "#e377c2"]
@@ -188,31 +384,107 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
     if args.seed is not None:
         torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
 
+    # Handle multiple temperatures/fields
+    from utils_ising import get_temp_field_batch, sample_temp_field
+    use_multi_temp_field = hasattr(args, 'temps') and args.temps is not None and (
+        len(args.temps) > 1 or (hasattr(args, 'fields') and args.fields is not None and len(args.fields) > 1)
+    )
+    
+    # Initialize temps/fields for dynamic sampling
+    # Store starting temps/fields for validation (fixed, not dynamically sampled)
+    starting_temps = None
+    starting_fields = None
+    if use_multi_temp_field:
+        current_temps = np.array(args.temps)
+        current_fields = np.array(args.fields) if hasattr(args, 'fields') and args.fields is not None else np.array([0.0])
+        # Store starting values for validation
+        starting_temps = current_temps.copy()
+        starting_fields = current_fields.copy()
+        rng = np.random.default_rng(seed=args.seed if args.seed is not None else 42)
+    else:
+        current_temps = None
+        current_fields = None
+        rng = None
+
     x_saved, log_rnd_saved = None, None
     
     for epoch in pbar:
         model.train(); optimizer.zero_grad(); info = {}
+
+        # Generate temperature/field batches if using multiple temps/fields
+        beta_batch = None
+        h_batch = None
+        log_dict_temp_field = {}  # Initialize for logging
+        if use_multi_temp_field:
+            # Handle dynamic sampling if enabled
+            if hasattr(args, 'sample_delta_temp') and args.sample_delta_temp:
+                # Use provided min/max temps if available, otherwise compute from current temps
+                if hasattr(args, 'min_temp') and args.min_temp is not None:
+                    min_temp = args.min_temp
+                else:
+                    min_temp = current_temps.min() - args.delta_temp
+                if hasattr(args, 'max_temp') and args.max_temp is not None:
+                    max_temp = args.max_temp
+                else:
+                    max_temp = current_temps.max() + args.delta_temp
+                current_temps = sample_temp_field(
+                    current_temps, args.delta_temp, min_temp, max_temp, rng
+                )
+            if hasattr(args, 'sample_delta_field') and args.sample_delta_field:
+                min_field = current_fields.min() - args.delta_field
+                max_field = current_fields.max() + args.delta_field
+                current_fields = sample_temp_field(
+                    current_fields, args.delta_field, min_field, max_field, rng
+                )
+            
+            # Generate batch of temps/fields
+            beta_batch, h_batch, _, _, _ = get_temp_field_batch(
+                current_temps, current_fields, args.batch_size
+            )
+            beta_batch = beta_batch.to(device)
+            h_batch = h_batch.to(device)
+            
+            # Log temperature and field statistics
+            if beta_batch is not None:
+                # Convert beta back to temperature for logging (beta = 1/T, so T = 1/beta)
+                temp_batch = 1.0 / beta_batch.cpu().numpy()
+                log_dict_temp_field = {
+                    "train/temp_min": float(temp_batch.min()),
+                    "train/temp_max": float(temp_batch.max()),
+                    "train/temp_mean": float(temp_batch.mean()),
+                    "train/temp_std": float(temp_batch.std()),
+                    "train/field_min": float(h_batch.cpu().min().item()),
+                    "train/field_max": float(h_batch.cpu().max().item()),
+                    "train/field_mean": float(h_batch.cpu().mean().item()),
+                    "train/field_std": float(h_batch.cpu().std().item()),
+                }
 
         if args.loss_fn == 'wdce':
             with torch.no_grad():
                 if x_saved is None or epoch % args.resample_every_n_step == 0:
                     ema.store(model.parameters())
                     ema.copy_to(model.parameters())
-                    x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
+                    x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device,
+                                     beta_batch=beta_batch, h_batch=h_batch, J=args.J if hasattr(args, 'J') else 1)
                     ema.restore(model.parameters())
                     x_saved, log_rnd_saved = x, log_rnd
                 else:
                     x, log_rnd = x_saved, log_rnd_saved
 
+            # Note: train_ddp doesn't have multi-temp/field setup, so pass None
             loss = loss_wdce(model, log_rnd, x,
-                                num_replicates=args.wdce_num_replicates)
+                                num_replicates=args.wdce_num_replicates,
+                                beta_batch=None, h_batch=None)
         else:
-            x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
+            x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device,
+                             beta_batch=beta_batch, h_batch=h_batch, J=args.J if hasattr(args, 'J') else 1)
             loss = loss_fn(log_rnd)
                 
         # Synchronize loss across processes
         
-        logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model)
+        logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model,
+                                                       beta_batch=beta_batch, h_batch=h_batch,
+                                                       J=args.J if hasattr(args, 'J') else 1)
         vfe = logp_x_vals - logf_t_vals  # variational free energy
         ess_train.append(ess(log_rnd))
         info['ess_train'] = ess_train[-1]
@@ -230,10 +502,15 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                 "train/std_logf_t": logf_t_vals.std().item(),
             }
             
+            # Add temperature and field statistics if available
+            if log_dict_temp_field:
+                log_dict.update(log_dict_temp_field)
+            
             # Log lattice visualization periodically (every 100 epochs)
             if L is not None and epoch % 100 == 0:
                 try:
-                    fig = _visualize_lattices(x, L, n_rows=2, n_cols=5, max_samples=10)
+                    fig = _visualize_lattices(x, L, n_rows=2, n_cols=5, max_samples=10,
+                                              beta_batch=beta_batch, h_batch=h_batch)
                     log_dict["train/samples"] = wandb.Image(fig)
                     plt.close(fig)
                 except Exception as e:
@@ -254,33 +531,52 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
         if epoch % args.eval_every == 0:
             model.eval()
             with torch.no_grad():
-                x, log_rnd = rnd(model, reward_fn, args.eval_batch_size, device=device)
+                # Generate eval temp/field batches if using multiple temps/fields
+                # Use starting temps/fields (fixed) for validation, not dynamically sampled ones
+                eval_beta_batch = None
+                eval_h_batch = None
+                if use_multi_temp_field:
+                    eval_beta_batch, eval_h_batch, _, _, _ = get_temp_field_batch(
+                        starting_temps, starting_fields, args.eval_batch_size
+                    )
+                    eval_beta_batch = eval_beta_batch.to(device)
+                    eval_h_batch = eval_h_batch.to(device)
+                
+                x, log_rnd = rnd(model, reward_fn, args.eval_batch_size, device=device,
+                                 beta_batch=eval_beta_batch, h_batch=eval_h_batch, 
+                                 J=args.J if hasattr(args, 'J') else 1)
                 eval_ess = ess(log_rnd)
                 ess_eval.append(eval_ess)
                 if wandb_run is not None:
-                    logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model)
+                    logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model,
+                                                                   beta_batch=eval_beta_batch, h_batch=eval_h_batch,
+                                                                   J=args.J if hasattr(args, 'J') else 1)
                     vfe = logp_x_vals - logf_t_vals  # variational free energy
-                    log_dict = {
-                        "val/avg_free_energy": vfe.mean().item(),
-                        "val/std_free_energy": vfe.std().item(),
-                        "val/avg_logp_x": logp_x_vals.mean().item(),
-                        "val/std_logp_x": logp_x_vals.std().item(),
-                        "val/avg_logf_t": logf_t_vals.mean().item(),
-                        "val/std_logf_t": logf_t_vals.std().item(),
-                        "val/ess": eval_ess,
-                    }
+                    
+                    # Use the new per-condition logging function (similar to snowyflow)
+                    log_validation_metrics(
+                        wandb_run=wandb_run,
+                        logp_x=logp_x_vals,
+                        logf_t=logf_t_vals,
+                        vfe=vfe,
+                        beta_batch=eval_beta_batch,
+                        h_batch=eval_h_batch,
+                        step=epoch,
+                    )
+                    
+                    # Also log ESS (not included in per-condition metrics)
+                    wandb_run.log({"val/ess": eval_ess}, step=epoch)
                     
                     # Log lattice visualization during evaluation
                     if L is not None:
                         try:
-                            fig = _visualize_lattices(x, L, n_rows=2, n_cols=5, max_samples=10)
-                            log_dict["val/samples"] = wandb.Image(fig)
+                            fig = _visualize_lattices(x, L, n_rows=2, n_cols=5, max_samples=10,
+                                                      beta_batch=eval_beta_batch, h_batch=eval_h_batch)
+                            wandb_run.log({"val/samples": wandb.Image(fig)}, step=epoch)
                             plt.close(fig)
                         except Exception as e:
                             # Silently skip visualization if there's an error
                             pass
-                    
-                    wandb_run.log(log_dict, step=epoch)
             model.train()
             
     return model, optimizer, ema, losses, ess_train, ess_eval
@@ -317,14 +613,17 @@ def train_ddp(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema
                 if x_saved is None or epoch % args.resample_every_n_step == 0:
                     ema.store(model.parameters())
                     ema.copy_to(model.parameters())
+                    # Note: train_ddp doesn't have multi-temp/field setup, so beta_batch/h_batch will be None
                     x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
                     ema.restore(model.parameters())
                     x_saved, log_rnd_saved = x, log_rnd
                 else:
                     x, log_rnd = x_saved, log_rnd_saved
 
+            # beta_batch and h_batch will be None in train_ddp (no multi-temp/field support yet)
             loss = loss_wdce(model, log_rnd, x,
-                                num_replicates=args.wdce_num_replicates)
+                                num_replicates=args.wdce_num_replicates,
+                                beta_batch=None, h_batch=None)
         else:
             x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device)
             loss = loss_fn(log_rnd)

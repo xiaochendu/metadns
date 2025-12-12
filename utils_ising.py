@@ -12,6 +12,125 @@ from matplotlib.colors import ListedColormap
 from tqdm import tqdm
 
 
+def sample_temp_field(curr_vals, delta, min_val, max_val, rng=None):
+    """Sample temperature or field values with small random perturbations.
+    
+    Args:
+        curr_vals: Current values (array)
+        delta: Maximum perturbation
+        min_val: Minimum allowed value
+        max_val: Maximum allowed value
+        rng: Random number generator (optional)
+        
+    Returns:
+        New values with perturbations, clipped to [min_val, max_val]
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    
+    curr_vals = np.array(curr_vals)
+    perturbations = rng.uniform(-delta, delta, size=curr_vals.shape)
+    new_vals = curr_vals + perturbations
+    return np.clip(new_vals, min_val, max_val)
+
+
+def get_temp_field_batch(temps, fields, batch_size):
+    """Generate a batch of temperatures and fields for the model.
+    
+    Args:
+        temps: Array of temperatures (can be single value, list, or array).
+               If single value, will be converted to array.
+        fields: Array of fields (can be single value, list, or array).
+                If single value, will be converted to array.
+        batch_size: Total batch size. Must be divisible by num_temps * num_fields.
+        
+    Returns:
+        beta_batch: [B] tensor of beta values (beta = 1/T)
+        h_batch: [B] tensor of field values
+        num_temps: Number of unique temperatures
+        num_fields: Number of unique fields
+        batchsize_slice: Number of samples per condition
+    """
+    # Convert to numpy arrays
+    if not isinstance(temps, np.ndarray):
+        temps = np.array([temps] if np.isscalar(temps) else temps)
+    if not isinstance(fields, np.ndarray):
+        fields = np.array([fields] if np.isscalar(fields) else fields)
+    
+    temps = temps.flatten()
+    fields = fields.flatten()
+    num_temps = len(temps)
+    num_fields = len(fields)
+    
+    # Compute batch structure
+    batchsize_slice = batch_size // (num_temps * num_fields)
+    assert batchsize_slice * num_temps * num_fields == batch_size, (
+        f"batch_size ({batch_size}) must be divisible by "
+        f"num_temps ({num_temps}) * num_fields ({num_fields})"
+    )
+    
+    # Create broadcast structure: [batchsize_slice, num_temps, num_fields]
+    # temps: broadcast along temp dimension
+    # fields: broadcast along field dimension
+    temps_broadcast = np.broadcast_to(
+        temps[None, :, None], (batchsize_slice, num_temps, num_fields)
+    )
+    fields_broadcast = np.broadcast_to(
+        fields[None, None, :], (batchsize_slice, num_temps, num_fields)
+    )
+    
+    # Flatten to [B] and convert to torch tensors
+    # Note: beta = 1/T, so we compute beta from temperature
+    # Flattening order (C-order/row-major): cycles through temps for each batch index
+    # Copy arrays to make them writable and avoid warnings
+    beta_batch = torch.from_numpy((1.0 / temps_broadcast).copy()).flatten().float()
+    h_batch = torch.from_numpy(fields_broadcast.copy()).flatten().float()
+    
+    return beta_batch, h_batch, num_temps, num_fields, batchsize_slice
+
+
+def reward_fn_ising(S, beta=0.28, J=1, h=0): 
+    """Compute reward for Ising model.
+    
+    Args:
+        S: [B, D] tensor of samples (values in {0, 1})
+        beta: Scalar or [B] tensor of inverse temperatures
+        J: Scalar interaction strength
+        h: Scalar or [B] tensor of field values
+        
+    Returns:
+        rewards: [B] tensor of rewards (-beta * H(x))
+    """
+    import numpy as np
+    import torch
+
+    # Convert S from {0,1} to {-1,1}
+    S_spins = 2 * S - 1
+    
+    # Compute Hamiltonian (ising2d_ham handles per-sample h/J)
+    H = ising2d_ham(S_spins, J, h)  # [B]
+    
+    # Handle broadcasting: if beta is scalar, broadcast; if [B], use element-wise
+    if isinstance(beta, (int, float)) or (isinstance(beta, torch.Tensor) and beta.ndim == 0):
+        # Scalar beta
+        beta_val = float(beta) if not isinstance(beta, torch.Tensor) else beta.item()
+        rewards = -beta_val * H
+    else:
+        # [B] tensor beta
+        if isinstance(beta, np.ndarray):
+            beta_tensor = torch.from_numpy(beta).to(H.device).float()
+        elif not isinstance(beta, torch.Tensor):
+            beta_tensor = torch.tensor(beta, device=H.device, dtype=H.dtype)
+        else:
+            beta_tensor = beta
+        # Ensure beta is on same device as H
+        if beta_tensor.device != H.device:
+            beta_tensor = beta_tensor.to(H.device)
+        rewards = -beta_tensor * H
+    
+    return rewards
+
+
 def ising2d_ham(S, J=1.0, h=0.0):
     r"""
     Compute the Hamiltonian for a batch of configurations in a 2D Ising model, with periodic boundary conditions.
@@ -19,8 +138,8 @@ def ising2d_ham(S, J=1.0, h=0.0):
     Parameters:
     - S: torch.tensor of shape (B, L * L)
         each element is -1 or 1 (not 0 or 1!), representing spin configurations.
-    - J: float, interaction strength between neighboring spins (default=1.0).
-    - h: float, external magnetic field strength (default=0.0).
+    - J: float or [B] tensor, interaction strength between neighboring spins (default=1.0).
+    - h: float or [B] tensor, external magnetic field strength (default=0.0).
 
     Returns:
     - hamiltonians: torch.tensor of shape (B,) containing the Hamiltonian for each configuration.
@@ -33,8 +152,29 @@ def ising2d_ham(S, J=1.0, h=0.0):
     S = S.view(S.size(0), int(S.shape[1]**.5), int(S.shape[1]**.5))
     Sx = torch.roll(S, shifts=-1, dims=1)  # Sx[i,j] = S[i+1,j]
     Sy = torch.roll(S, shifts=-1, dims=2)  # Sy[i,j] = S[i,j+1]
-    interaction_energy = -J * torch.sum(S * (Sx + Sy), dim=(1, 2))
-    magnetic_energy = -h * torch.sum(S, dim=(1, 2))
+    
+    # Compute interaction energy
+    interaction_sum = torch.sum(S * (Sx + Sy), dim=(1, 2))  # [B]
+    if isinstance(J, torch.Tensor) and J.ndim > 0:
+        # Per-sample J
+        if J.device != S.device:
+            J = J.to(S.device)
+        interaction_energy = -J * interaction_sum
+    else:
+        # Scalar J
+        interaction_energy = -float(J) * interaction_sum
+    
+    # Compute magnetic energy
+    magnetic_sum = torch.sum(S, dim=(1, 2))  # [B]
+    if isinstance(h, torch.Tensor) and h.ndim > 0:
+        # Per-sample h
+        if h.device != S.device:
+            h = h.to(S.device)
+        magnetic_energy = -h * magnetic_sum
+    else:
+        # Scalar h
+        magnetic_energy = -float(h) * magnetic_sum
+    
     return interaction_energy + magnetic_energy
 
 
