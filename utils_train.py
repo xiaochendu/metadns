@@ -8,8 +8,8 @@ import torch.distributed as dist
 import wandb
 from matplotlib.colors import ListedColormap
 from tqdm import tqdm
-
-from utils import ess, sample_categorical_logits
+from utils import ess, plot_bias_grid, sample_categorical_logits
+from utils_ising import ising2d_mag
 
 
 def rnd(model, reward_model, batch_size, device='cuda:0', beta_batch=None, h_batch=None, J=1):
@@ -370,7 +370,8 @@ def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16,
 
 
 def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=None,
-          losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None):
+          losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None, 
+          bias_potential=None, current_fields=None, rng=None):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
                'wdce': loss_wdce}.get(args.loss_fn)
     if loss_fn is None:
@@ -395,16 +396,20 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
     starting_temps = None
     starting_fields = None
     if use_multi_temp_field:
-        current_temps = np.array(args.temps)
-        current_fields = np.array(args.fields) if hasattr(args, 'fields') and args.fields is not None else np.array([0.0])
+        if current_temps is None:
+             current_temps = np.array(args.temps)
+        if current_fields is None:
+             current_fields = np.array(args.fields) if hasattr(args, 'fields') and args.fields is not None else np.array([0.0])
         # Store starting values for validation
         starting_temps = current_temps.copy()
         starting_fields = current_fields.copy()
-        rng = np.random.default_rng(seed=args.seed if args.seed is not None else 42)
+        if rng is None:
+            rng = np.random.default_rng(seed=args.seed if args.seed is not None else 42)
     else:
         current_temps = None
-        current_fields = None
-        rng = None
+        # current_fields = None # Already passed or initialized
+        if rng is None:
+             rng = None
 
     x_saved, log_rnd_saved = None, None
     
@@ -479,6 +484,20 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
             x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device,
                              beta_batch=beta_batch, h_batch=h_batch, J=args.J if hasattr(args, 'J') else 1)
             loss = loss_fn(log_rnd)
+
+        # Update bias after sampling (on-policy update)
+        if bias_potential is not None:
+            # Calculate CV (Magnetization)
+            with torch.no_grad():
+                # x is [B, D] in {0, 1} usually? 
+                # utils_ising functions usually expect {-1, 1} but handle it?
+                # train_ising.py reward_fn converts 0/1 to -1/1.
+                # ising2d_mag inside utils_ising expects {-1, 1}
+                # rnd returns x in {0..(vocab-1)}. For Ising vocab=2 (0, 1).
+                # So we must convert to spins for ising2d_mag: 2*x - 1
+                x_spins = 2 * x - 1
+                s = ising2d_mag(x_spins)
+                bias_potential.update(s)
                 
         # Synchronize loss across processes
         
@@ -501,6 +520,24 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                 "train/avg_logf_t": logf_t_vals.mean().item(),
                 "train/std_logf_t": logf_t_vals.std().item(),
             }
+            
+            # Log bias stats
+            if bias_potential is not None:
+                # We can't plot the whole grid every step easily, just stats
+                # Using get_bias_grid_np() if available or accessing internal
+                if hasattr(bias_potential, 'bias_grid'):
+                    bias_grid = bias_potential.bias_grid.detach().cpu().numpy()
+                    log_dict["bias/max_height"] = bias_grid.max()
+                    log_dict["bias/mean_height"] = bias_grid.mean()
+                    # Fraction of visited states (nonzero bias)
+                    log_dict["bias/coverage"] = (bias_grid > 1e-6).mean()
+                    
+                    # Plot bias grid every 100 epochs
+                    if epoch % 100 == 0:
+                        fig_bias = plot_bias_grid(bias_potential, epoch)
+                        if fig_bias is not None:
+                            log_dict["bias/grid_plot"] = wandb.Image(fig_bias)
+                            plt.close(fig_bias)
             
             # Add temperature and field statistics if available
             if log_dict_temp_field:

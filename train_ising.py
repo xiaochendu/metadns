@@ -3,10 +3,9 @@ from warnings import simplefilter
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-
 from model import ExponentialMovingAverage, get_rope_vit_model
 from utils import Dict2Obj, plot_loss_ess
-from utils_ising import ising2d_ham, reward_fn_ising
+from utils_ising import ising2d_ham, ising2d_mag, reward_fn_ising
 from utils_train import train
 
 simplefilter(action='ignore', category=FutureWarning)
@@ -17,6 +16,8 @@ from pathlib import Path
 from pprint import pformat
 
 import wandb
+from bias import BiasPotential
+from utils_ising import ising2d_mag
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--device', type=str, default="cuda:0")
@@ -52,6 +53,14 @@ parser.add_argument('--min_temp', type=float, default=1.667,
                     help='Minimum temperature for dynamic sampling')
 parser.add_argument('--max_temp', type=float, default=3.5714,
                     help='Maximum temperature for dynamic sampling')
+parser.add_argument('--use_bias', action='store_true', help='Enable biased sampling (WT-ASBS)')
+parser.add_argument('--bias_sigma', type=float, default=0.05, help='Sigma for Gaussian bias kernel')
+parser.add_argument('--bias_height', type=float, default=0.1, help='Initial height (W) for bias kernel')
+parser.add_argument('--bias_factor', type=float, default=10.0, help='Bias factor (gamma) for Well-Tempered Metadynamics')
+parser.add_argument('--bias_grid_size', type=int, default=100, help='Grid size for CV (Magnetization)')
+parser.add_argument('--kernel_type', type=str, default='gaussian', help='Kernel type: gaussian or delta')
+parser.add_argument('--cv_min', type=float, default=-1.0, help='Minimum value for CV')
+parser.add_argument('--cv_max', type=float, default=1.0, help='Maximum value for CV')
 args = parser.parse_args()
 
 if args.use_anneal:
@@ -112,16 +121,24 @@ cfg = {'tokens': 2,
        'delta_field': delta_field,
        'min_temp': min_temp,
        'max_temp': max_temp,
+       'use_bias': args.use_bias,
+       'bias_sigma': args.bias_sigma,
+       'bias_height': args.bias_height,
+       'bias_factor': args.bias_factor,
+       'bias_grid_size': args.bias_grid_size,
+       'kernel_type': args.kernel_type,
        'J': J}
 
 # Check batch size compatibility if using multiple temps/fields
 if len(temps) > 1 or len(fields) > 1:
     num_conditions = len(temps) * len(fields)
     if cfg['batch_size'] % num_conditions != 0:
-        raise ValueError(
-            f"batch_size ({cfg['batch_size']}) must be divisible by "
-            f"num_temps ({len(temps)}) * num_fields ({len(fields)}) = {num_conditions}"
-        )
+        bs = cfg['batch_size']
+        nt = len(temps)
+        nf = len(fields)
+        nc = num_conditions
+        msg = f"batch_size ({bs}) must be divisible by num_temps ({nt}) * num_fields ({nf}) = {nc}"
+        raise ValueError(msg)
     if cfg['eval_batch_size'] % num_conditions != 0:
         raise ValueError(
             f"eval_batch_size ({cfg['eval_batch_size']}) must be divisible by "
@@ -163,12 +180,31 @@ if not args.use_anneal:
         losses = checkpoint['losses']
         ess_train = checkpoint['ess_train']
         ess_eval = checkpoint['ess_eval']
+        current_fields = checkpoint.get('current_fields', None)
+        rng = checkpoint.get('rng', None)
     else:
         print("No checkpoint provided, starting from scratch")
         losses = []
         ess_train = []
         ess_eval = []
-        
+        current_fields = None
+        rng = None
+
+    # Initialize BiasPotential if enabled
+    bias_pot = None
+    if args.use_bias:
+        T_val = 1.0 / args.beta # Usually single beta for bias run
+        print(f"Initializing BiasPotential: sigma={args.bias_sigma}, height={args.bias_height}, gamma={args.bias_factor}, type={args.kernel_type}")
+        bias_pot = BiasPotential(
+            cv_min=args.cv_min, cv_max=args.cv_max, 
+            grid_size=args.bias_grid_size,
+            sigma=args.bias_sigma,
+            initial_height=args.bias_height,
+            bias_factor=args.bias_factor,
+            T=T_val,
+            kernel_type=args.kernel_type,
+            device=device
+        )
     model.train()
     # Create reward function wrapper that accepts optional beta/h for per-sample values
     default_beta = beta
@@ -179,11 +215,38 @@ if not args.use_anneal:
         h_val = h if h is not None else default_h
         return reward_fn_ising(x, beta=beta_val, J=J, h=h_val)
     
+    # Wrap reward function with bias if enabled
+    def biased_reward_fn(x, beta=None, h=None, J=J):
+        # 1. Standard reward
+        r = reward_fn(x, beta=beta, h=h, J=J)
+        
+        # 2. Add Bias: R' = R - beta * V(s)
+        if bias_pot is not None:
+             # Convert x (0,1) to spins (-1,1) for CV calc
+             s = ising2d_mag(2*x - 1)
+             v = bias_pot.evaluate(s)
+             
+             # Get beta for scaling
+             beta_val = beta if beta is not None else default_beta
+             # Handle tensor/scalar beta
+             if isinstance(beta_val, (int, float)):
+                 beta_tensor = torch.tensor(beta_val, device=x.device)
+             elif isinstance(beta_val, torch.Tensor):
+                 beta_tensor = beta_val.to(x.device)
+             else:
+                 beta_tensor = torch.tensor(beta_val, device=x.device) # Fallback
+             
+             r = r - beta_tensor * v
+        return r
+
+    actual_reward_fn = biased_reward_fn if args.use_bias else reward_fn
+    
     model, optimizer, ema, losses, ess_train, ess_eval = train(
-        model, optimizer, reward_fn, 
+        model, optimizer, actual_reward_fn, 
         Dict2Obj(cfg), device, ema=ema, num_epochs=args.num_epochs,
         losses=losses, ess_train=ess_train, ess_eval=ess_eval,
-        wandb_run=wandb_run, L=L)
+        wandb_run=wandb_run, L=L, bias_potential=bias_pot,
+        current_fields=current_fields, rng=rng)
     
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")

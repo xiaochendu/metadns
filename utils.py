@@ -1,5 +1,5 @@
-from matplotlib import pyplot as plt
 import torch
+from matplotlib import pyplot as plt
 
 
 def sample_categorical(categorical_probs, dtype=torch.float64):
@@ -76,3 +76,23 @@ def cycleloader(dataloader):
     while True:
         for data in dataloader:
             yield data
+
+
+def plot_bias_grid(bias_potential, epoch):
+    """
+    Plots the bias potential grid.
+    Returns a matplotlib figure.
+    """
+    try:
+        grid_vals, bias_vals = bias_potential.get_bias_grid_np()
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.plot(grid_vals, bias_vals)
+        ax.set_xlabel('CV (Magnetization)')
+        ax.set_ylabel('Bias Energy (V)')
+        ax.set_title(f'Bias Potential at Epoch {epoch}')
+        ax.grid(True)
+        plt.tight_layout()
+        return fig
+    except Exception as e:
+        print(f"Error plotting bias grid: {e}")
+        return None
