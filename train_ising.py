@@ -181,7 +181,10 @@ if not args.use_anneal:
         ess_train = checkpoint['ess_train']
         ess_eval = checkpoint['ess_eval']
         current_fields = checkpoint.get('current_fields', None)
+        ess_eval = checkpoint['ess_eval']
+        current_fields = checkpoint.get('current_fields', None)
         rng = checkpoint.get('rng', None)
+        bias_state = checkpoint.get('bias_potential', None)
     else:
         print("No checkpoint provided, starting from scratch")
         losses = []
@@ -205,18 +208,21 @@ if not args.use_anneal:
             kernel_type=args.kernel_type,
             device=device
         )
+        if resume_path is not None and bias_state is not None:
+             print("Loading BiasPotential from checkpoint...")
+             bias_pot.load_state_dict(bias_state)
     model.train()
     # Create reward function wrapper that accepts optional beta/h for per-sample values
     default_beta = beta
     default_h = h
-    def reward_fn(x, beta=None, h=None, J=J):
+    def reward_fn(x, beta=None, h=None, J=J, **kwargs):
         """Reward function wrapper that handles scalar or per-sample betas/fields."""
         beta_val = beta if beta is not None else default_beta
         h_val = h if h is not None else default_h
         return reward_fn_ising(x, beta=beta_val, J=J, h=h_val)
     
     # Wrap reward function with bias if enabled
-    def biased_reward_fn(x, beta=None, h=None, J=J):
+    def biased_reward_fn(x, beta=None, h=None, J=J, use_bias=True):
         # 1. Standard reward
         r = reward_fn(x, beta=beta, h=h, J=J)
         
@@ -236,7 +242,7 @@ if not args.use_anneal:
              else:
                  beta_tensor = torch.tensor(beta_val, device=x.device) # Fallback
              
-             r = r - beta_tensor * v
+             r = r - beta_tensor * v if use_bias else r
         return r
 
     actual_reward_fn = biased_reward_fn if args.use_bias else reward_fn
@@ -256,6 +262,9 @@ if not args.use_anneal:
         'ema_state_dict': ema.state_dict(),
         'losses': losses, 'ess_train': ess_train, 
         'ess_eval': ess_eval,
+        'losses': losses, 'ess_train': ess_train, 
+        'ess_eval': ess_eval,
+        'bias_potential': bias_pot.state_dict() if bias_pot is not None else None,
         'cfg': cfg}, f'{dir_name}/weights.pth')
 else:
     model.train()
@@ -279,6 +288,9 @@ else:
         'ema_state_dict': ema.state_dict(),
         'losses': losses, 'ess_train': ess_train, 
         'ess_eval': ess_eval,
+        'losses': losses, 'ess_train': ess_train, 
+        'ess_eval': ess_eval,
+        'bias_potential': bias_pot.state_dict() if bias_pot is not None else None,
         'cfg': cfg}, f'{dir_name}/weights_warmup.pth')
     
     # Create reward function for main training phase
@@ -302,6 +314,9 @@ else:
         'ema_state_dict': ema.state_dict(),
         'losses': losses, 'ess_train': ess_train, 
         'ess_eval': ess_eval,
+        'losses': losses, 'ess_train': ess_train, 
+        'ess_eval': ess_eval,
+        'bias_potential': bias_pot.state_dict() if bias_pot is not None else None,
         'cfg': cfg}, f'{dir_name}/weights_final.pth')
 
 if wandb_run is not None:

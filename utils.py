@@ -78,21 +78,78 @@ def cycleloader(dataloader):
             yield data
 
 
-def plot_bias_grid(bias_potential, epoch):
+def plot_bias_analysis(bias_potential, epoch, s_batch=None):
     """
-    Plots the bias potential grid.
-    Returns a matplotlib figure.
+    Plots bias analysis:
+    1. Estimated Free Energy F(s) (from Bias Potential)
+    2. Raw Histogram P(s) (from batch) - Checks sampling uniformity
+    3. Reweighted Histogram P_corr(s) (Likely physical F(s))
+    
+    s_batch: Tensor/Array of CV values from current batch
     """
     try:
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        
+        # 1. Estimated Free Energy from Bias
+        # F(s) ~ - (gamma / (gamma - 1)) * V(s)
         grid_vals, bias_vals = bias_potential.get_bias_grid_np()
-        fig, ax = plt.subplots(figsize=(6, 4))
-        ax.plot(grid_vals, bias_vals)
-        ax.set_xlabel('CV (Magnetization)')
-        ax.set_ylabel('Bias Energy (V)')
-        ax.set_title(f'Bias Potential at Epoch {epoch}')
-        ax.grid(True)
+        gamma = bias_potential.gamma
+        if gamma > 1.0:
+            free_energy_profile = - (gamma / (gamma - 1)) * bias_vals
+        else:
+            free_energy_profile = - bias_vals # Fallback or standard metadynamics
+            
+        # Shift to zero minimum for relative interpretation
+        free_energy_profile = free_energy_profile - free_energy_profile.min()
+            
+        axes[0].plot(grid_vals, free_energy_profile, label='F(s) Estimate', color='blue')
+        axes[0].set_title(f'Est. Relative Free Energy (Ep {epoch})')
+        axes[0].set_xlabel('CV (Magnetization)')
+        axes[0].set_ylabel('Energy')
+        axes[0].grid(True)
+        axes[0].legend()
+
+        # We will need a lot of samples to get a good estimate
+
+        # 2. Raw Distribution (Histogram of s)
+        # Should be effectively flat if converged
+        if s_batch is not None:
+            if isinstance(s_batch, torch.Tensor):
+                s_np = s_batch.detach().cpu().numpy()
+            else:
+                s_np = s_batch
+                
+            # Histogram
+            axes[1].hist(s_np, bins=bias_potential.grid_size, range=(-1, 1), density=True, alpha=0.6, color='green', label='Sampled')
+            axes[1].set_title('Raw Distribution P(s) (Should be Flat)')
+            axes[1].set_xlabel('CV')
+            axes[1].set_ylabel('Density')
+            axes[1].grid(True)
+            
+            # 3. Corrected Distribution (Reweighted)
+            # P_unbiased(s) ~ P_biased(s) * exp(beta * V(s))
+            # weight = exp( bias_potential.evaluate(s) / T )
+            # We compute weights for the batch
+            # Note: bias_potential.evaluate expects tensor
+            with torch.no_grad():
+                if not isinstance(s_batch, torch.Tensor):
+                     s_tens = torch.tensor(s_batch, device=bias_potential.device)
+                else:
+                     s_tens = s_batch.to(bias_potential.device)
+                     
+                v_s = bias_potential.evaluate(s_tens) # [B]
+                # beta = 1/T
+                beta = 1.0 / bias_potential.T
+                weights = torch.exp(beta * v_s).cpu().numpy()
+            
+            axes[2].hist(s_np, bins=bias_potential.grid_size, range=(-1, 1), density=True, weights=weights, alpha=0.6, color='red', label='Reweighted')
+            axes[2].set_title('Corrected Distribution P(s) (Physical)')
+            axes[2].set_xlabel('CV')
+            axes[2].set_ylabel('Density')
+            axes[2].grid(True)
+
         plt.tight_layout()
         return fig
     except Exception as e:
-        print(f"Error plotting bias grid: {e}")
+        print(f"Error plotting bias analysis: {e}")
         return None

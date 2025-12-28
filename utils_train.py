@@ -8,7 +8,7 @@ import torch.distributed as dist
 import wandb
 from matplotlib.colors import ListedColormap
 from tqdm import tqdm
-from utils import ess, plot_bias_grid, sample_categorical_logits
+from utils import ess, plot_bias_analysis, sample_categorical_logits
 from utils_ising import ising2d_mag
 
 
@@ -254,7 +254,8 @@ def log_validation_metrics(
         wandb_run.log(conditions_log_data_prefixed, step=step, **log_kwargs)
 
 
-def _compute_log_stats(x, log_rnd, reward_fn, model, beta_batch=None, h_batch=None, J=1):
+def _compute_log_stats(x, log_rnd, reward_fn, model, beta_batch=None, h_batch=None, J=1,
+                       bias_potential=None):
     """Compute logf_t and logp_x given samples and RND values.
     
     Args:
@@ -268,15 +269,34 @@ def _compute_log_stats(x, log_rnd, reward_fn, model, beta_batch=None, h_batch=No
     """
     # Compute logf_t using per-sample betas/fields if provided
     if beta_batch is not None or h_batch is not None:
-        logf_t_vals = reward_fn(x, beta=beta_batch, h=h_batch if h_batch is not None else 0, J=J)
+        logf_t_vals = reward_fn(x, beta=beta_batch, h=h_batch if h_batch is not None else 0, J=J, use_bias=False)
     else:
-        logf_t_vals = reward_fn(x)  # Use default scalar values
-    
+        logf_t_vals = reward_fn(x, use_bias=False)  # Use default scalar values
     num_states = getattr(model, "vocab_size", 3) - 1  # exclude mask token
     data_dim = x.shape[1]
     uniform_prior_term = -torch.log(torch.tensor(float(num_states), device=x.device))
     uniform_prior_total = uniform_prior_term * data_dim
     logp_x_vals = uniform_prior_total + logf_t_vals - log_rnd
+    
+    # Correct logp_x vals if bias_potential is provided
+    # logp_x_effective = logp_model(x) + beta * V(s)
+    # This recovers the effective sampling probability with respect to the unbiased Hamiltonian
+    # assuming logf_t_vals is unbiased (which it is, see use_bias=False above)
+    if bias_potential is not None:
+        with torch.no_grad():
+            x_spins = 2 * x - 1
+            s = ising2d_mag(x_spins)
+            bias_vals = bias_potential.evaluate(s) # [B]
+            
+            # Apply beta correction
+            if beta_batch is not None:
+                logp_x_vals = logp_x_vals - beta_batch * bias_vals
+            else:
+                 # Assume standard T from bias potential or model
+                 # Train Ising sets bias_potential.T = 1/beta
+                 beta = 1.0 / bias_potential.T
+                 logp_x_vals = logp_x_vals - beta * bias_vals
+                 
     return logf_t_vals, logp_x_vals
 
 
@@ -503,7 +523,8 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
         
         logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model,
                                                        beta_batch=beta_batch, h_batch=h_batch,
-                                                       J=args.J if hasattr(args, 'J') else 1)
+                                                       J=args.J if hasattr(args, 'J') else 1,
+                                                       bias_potential=bias_potential)
         vfe = logp_x_vals - logf_t_vals  # variational free energy
         ess_train.append(ess(log_rnd))
         info['ess_train'] = ess_train[-1]
@@ -532,12 +553,12 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                     # Fraction of visited states (nonzero bias)
                     log_dict["bias/coverage"] = (bias_grid > 1e-6).mean()
                     
-                    # Plot bias grid every 100 epochs
-                    if epoch % 100 == 0:
-                        fig_bias = plot_bias_grid(bias_potential, epoch)
-                        if fig_bias is not None:
-                            log_dict["bias/grid_plot"] = wandb.Image(fig_bias)
-                            plt.close(fig_bias)
+                    # Plot bias analysis every 100 epochs (REMOVED: Moved to validation)
+                    # if epoch % 100 == 0:
+                    #     fig_bias = plot_bias_analysis(bias_potential, epoch, s_batch=s)
+                    #     if fig_bias is not None:
+                    #         log_dict["bias/analysis_plot"] = wandb.Image(fig_bias)
+                    #         plt.close(fig_bias)
             
             # Add temperature and field statistics if available
             if log_dict_temp_field:
@@ -587,7 +608,8 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                 if wandb_run is not None:
                     logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model,
                                                                    beta_batch=eval_beta_batch, h_batch=eval_h_batch,
-                                                                   J=args.J if hasattr(args, 'J') else 1)
+                                                                   J=args.J if hasattr(args, 'J') else 1,
+                                                                   bias_potential=bias_potential)
                     vfe = logp_x_vals - logf_t_vals  # variational free energy
                     
                     # Use the new per-condition logging function (similar to snowyflow)
@@ -614,6 +636,19 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                         except Exception as e:
                             # Silently skip visualization if there's an error
                             pass
+
+                    # Plot bias analysis during validation (uses eval_batch_size)
+                    if bias_potential is not None:
+                        try:
+                            # Convert x(0,1) to spins(-1,1) for CV
+                            x_spins_eval = 2 * x - 1
+                            s_eval = ising2d_mag(x_spins_eval)
+                            fig_bias = plot_bias_analysis(bias_potential, epoch, s_batch=s_eval)
+                            if fig_bias is not None:
+                                wandb_run.log({"val/bias_analysis_plot": wandb.Image(fig_bias)}, step=epoch)
+                                plt.close(fig_bias)
+                        except Exception as e:
+                            print(f"Error plotting bias analysis during val: {e}")
             model.train()
             
     return model, optimizer, ema, losses, ess_train, ess_eval

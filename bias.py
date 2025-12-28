@@ -1,5 +1,6 @@
-import torch
 import numpy as np
+import torch
+
 
 class BiasPotential:
     """
@@ -141,6 +142,32 @@ class BiasPotential:
         
         return self.bias_grid[indices_long]
 
+
     def get_bias_grid_np(self):
         """Return grid for plotting (numpy)"""
         return self.grid_vals.detach().cpu().numpy(), self.bias_grid.detach().cpu().numpy()
+
+    def state_dict(self):
+        """Return state dictionary for saving."""
+        return {
+            'bias_grid': self.bias_grid,
+            'grid_vals': self.grid_vals,
+            'params': {
+                'cv_min': self.cv_min,
+                'cv_max': self.cv_max,
+                'grid_size': self.grid_size,
+                'sigma': self.sigma,
+                'initial_height': self.initial_height,
+                'bias_factor': self.gamma,
+                'T': self.T,
+                'kernel_type': self.kernel_type
+            }
+        }
+
+    def load_state_dict(self, state_dict):
+        """Load state from dictionary."""
+        self.bias_grid = state_dict['bias_grid'].to(self.device)
+        self.grid_vals = state_dict['grid_vals'].to(self.device)
+        # We assume params are consistent or handled by init, 
+        # but we could optionally overwrite them if needed. 
+        # For now, just loading the grid is the most critical part.
