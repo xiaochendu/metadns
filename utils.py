@@ -1,5 +1,41 @@
+from pathlib import Path
+from typing import Literal
+
+import matplotlib.pyplot as plt
+import numpy as np
+import seaborn as sns
 import torch
 from matplotlib import pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap
+from matplotlib.figure import Figure
+
+
+def get_periodic_table_colormap() -> LinearSegmentedColormap:
+    """Create a custom colormap matching the periodic table color scheme.
+
+    Returns a colormap that transitions from dark blue (low values)
+    to light yellow/green (high values), matching the periodic table visualization style.
+    Higher values appear lighter. This colormap is colorblind-friendly as it avoids
+    red-green combinations.
+
+    Returns:
+        LinearSegmentedColormap: A custom colormap for heat plots
+    """
+    # Define colors matching the periodic table palette
+    # Reversed: Dark blue -> medium blue -> cyan -> green -> light yellow/green
+    # Higher values are now lighter (reversed from original)
+    # RGB values chosen to match the periodic table visualization
+    colors = [
+        (0.03, 0.08, 0.45),  # Dark blue (low values, ~1-10)
+        (0.08, 0.25, 0.65),  # Medium blue (~10-100)
+        (0.15, 0.50, 0.75),  # Cyan-blue (~100)
+        (0.35, 0.70, 0.65),  # Green-cyan (~100-1K)
+        (0.60, 0.85, 0.50),  # Medium green (~1K)
+        (0.85, 0.95, 0.55),  # Yellow-green (~1K-10K)
+        (0.98, 0.98, 0.65),  # Light yellow/green (high values, ~10K)
+    ]
+    n_bins = 256
+    return LinearSegmentedColormap.from_list("periodic_table", colors, N=n_bins)
 
 
 def sample_categorical(categorical_probs, dtype=torch.float64):

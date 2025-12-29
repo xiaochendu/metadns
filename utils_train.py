@@ -12,6 +12,20 @@ from utils import ess, plot_bias_analysis, sample_categorical_logits
 from utils_ising import ising2d_mag
 
 
+def save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg, path, bias_potential=None):
+    """Helper function to save model checkpoint."""
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'ema_state_dict': ema.state_dict() if ema is not None else None,
+        'losses': losses,
+        'ess_train': ess_train,
+        'ess_eval': ess_eval,
+        'bias_potential': bias_potential.state_dict() if bias_potential is not None else None,
+        'cfg': cfg
+    }, path)
+
+
 def rnd(model, reward_model, batch_size, device='cuda:0', beta_batch=None, h_batch=None, J=1):
     r"""
     Run random order sampling and compute the RND $\log\frac{dP^*}{dP^u}$ along the trajectory
@@ -391,7 +405,7 @@ def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16,
 
 def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=None,
           losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None, 
-          bias_potential=None, current_fields=None, rng=None):
+          bias_potential=None, current_fields=None, rng=None, save_dir=None, cfg_dict=None):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
                'wdce': loss_wdce}.get(args.loss_fn)
     if loss_fn is None:
@@ -584,6 +598,11 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
         if ema is not None: ema.update(model.parameters())
         
         pbar.set_postfix(loss=info['loss'], ess=info['ess_train'])
+
+        # Save checkpoint periodically
+        if save_dir is not None and getattr(args, 'save_every', 0) > 0 and (epoch + 1) % args.save_every == 0:
+            save_path = f"{save_dir}/ckpt_{epoch+1}.pth"
+            save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg_dict, save_path, bias_potential)
         
         # Evaluate periodically
         if epoch % args.eval_every == 0:

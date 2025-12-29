@@ -6,7 +6,7 @@ import torch
 from model import ExponentialMovingAverage, get_rope_vit_model
 from utils import Dict2Obj, plot_loss_ess
 from utils_ising import ising2d_ham, ising2d_mag, reward_fn_ising
-from utils_train import train
+from utils_train import save_checkpoint, train
 
 simplefilter(action='ignore', category=FutureWarning)
 import argparse
@@ -61,6 +61,7 @@ parser.add_argument('--bias_grid_size', type=int, default=100, help='Grid size f
 parser.add_argument('--kernel_type', type=str, default='gaussian', help='Kernel type: gaussian or delta')
 parser.add_argument('--cv_min', type=float, default=-1.0, help='Minimum value for CV')
 parser.add_argument('--cv_max', type=float, default=1.0, help='Maximum value for CV')
+parser.add_argument('--save_every', type=int, default=10000, help='Save checkpoint every N steps')
 args = parser.parse_args()
 
 if args.use_anneal:
@@ -127,6 +128,7 @@ cfg = {'tokens': 2,
        'bias_factor': args.bias_factor,
        'bias_grid_size': args.bias_grid_size,
        'kernel_type': args.kernel_type,
+       'save_every': args.save_every,
        'J': J}
 
 # Check batch size compatibility if using multiple temps/fields
@@ -252,26 +254,19 @@ if not args.use_anneal:
         Dict2Obj(cfg), device, ema=ema, num_epochs=args.num_epochs,
         losses=losses, ess_train=ess_train, ess_eval=ess_eval,
         wandb_run=wandb_run, L=L, bias_potential=bias_pot,
-        current_fields=current_fields, rng=rng)
+        current_fields=current_fields, rng=rng,
+        save_dir=dir_name, cfg_dict=cfg)
     
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'ema_state_dict': ema.state_dict(),
-        'losses': losses, 'ess_train': ess_train, 
-        'ess_eval': ess_eval,
-        'losses': losses, 'ess_train': ess_train, 
-        'ess_eval': ess_eval,
-        'bias_potential': bias_pot.state_dict() if bias_pot is not None else None,
-        'cfg': cfg}, f'{dir_name}/weights.pth')
+    save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg, f'{dir_name}/weights.pth', bias_pot)
 else:
+    bias_pot = None
     model.train()
     # Create reward function for annealing phase
     default_beta_anneal = args.anneal_beta
     default_h_anneal = h
-    def reward_fn_anneal(x, beta=None, h=None, J=J):
+    def reward_fn_anneal(x, beta=None, h=None, J=J, **kwargs):
         beta_val = beta if beta is not None else default_beta_anneal
         h_val = h if h is not None else default_h_anneal
         return reward_fn_ising(x, beta=beta_val, J=J, h=h_val)
@@ -279,24 +274,15 @@ else:
     model, optimizer, ema, losses, ess_train, ess_eval = train(
             model, optimizer, reward_fn_anneal, 
             Dict2Obj(cfg), device, num_epochs=args.anneal_epochs, ema=ema,
-            wandb_run=wandb_run, L=L)
+            wandb_run=wandb_run, L=L, save_dir=dir_name, cfg_dict=cfg)
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess_anneal.png")
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'ema_state_dict': ema.state_dict(),
-        'losses': losses, 'ess_train': ess_train, 
-        'ess_eval': ess_eval,
-        'losses': losses, 'ess_train': ess_train, 
-        'ess_eval': ess_eval,
-        'bias_potential': bias_pot.state_dict() if bias_pot is not None else None,
-        'cfg': cfg}, f'{dir_name}/weights_warmup.pth')
+    save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg, f'{dir_name}/weights_warmup.pth', bias_pot)
     
     # Create reward function for main training phase
     default_beta_main = beta
     default_h_main = h
-    def reward_fn_main(x, beta=None, h=None, J=J):
+    def reward_fn_main(x, beta=None, h=None, J=J, **kwargs):
         beta_val = beta if beta is not None else default_beta_main
         h_val = h if h is not None else default_h_main
         return reward_fn_ising(x, beta=beta_val, J=J, h=h_val)
@@ -305,19 +291,10 @@ else:
         model, optimizer, reward_fn_main, 
         Dict2Obj(cfg), device, num_epochs=args.num_epochs, 
         ema=ema, losses=losses, ess_train=ess_train, ess_eval=ess_eval,
-        wandb_run=wandb_run, L=L)
+        wandb_run=wandb_run, L=L, save_dir=dir_name, cfg_dict=cfg)
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'ema_state_dict': ema.state_dict(),
-        'losses': losses, 'ess_train': ess_train, 
-        'ess_eval': ess_eval,
-        'losses': losses, 'ess_train': ess_train, 
-        'ess_eval': ess_eval,
-        'bias_potential': bias_pot.state_dict() if bias_pot is not None else None,
-        'cfg': cfg}, f'{dir_name}/weights_final.pth')
+    save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg, f'{dir_name}/weights_final.pth', bias_pot)
 
 if wandb_run is not None:
     wandb_run.finish()
