@@ -136,7 +136,8 @@ def plot_bias_analysis(bias_potential, epoch, s_batch=None):
             free_energy_profile = - bias_vals # Fallback or standard metadynamics
             
         # Shift to zero minimum for relative interpretation
-        free_energy_profile = free_energy_profile - free_energy_profile.min()
+        # NOTE: Don't shift to better watch convergence
+        # free_energy_profile = free_energy_profile - free_energy_profile.min()
             
         axes[0].plot(grid_vals, free_energy_profile, label='F(s) Estimate', color='blue')
         axes[0].set_title(f'Est. Relative Free Energy (Ep {epoch})')

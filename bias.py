@@ -115,6 +115,14 @@ class BiasPotential:
                 kernel = self._get_gaussian_kernel(cv_val)
                 self.bias_grid += height * kernel
 
+    def normalize(self):
+        """
+        Shift the bias potential so that the minimum value is 0.
+        Often used to keep values bounded during training.
+        """
+        min_val = self.bias_grid.min()
+        self.bias_grid -= min_val
+
     def evaluate(self, cv_batch):
         """
         Return the bias energy V(s) for a batch of CV values.

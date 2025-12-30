@@ -29,8 +29,10 @@ parser.add_argument('--num_epochs', type=int, default=100000)
 parser.add_argument('--use_anneal', action='store_true')
 parser.add_argument('--anneal_beta', type=float, default=None)
 parser.add_argument('--anneal_epochs', type=int, default=None)
+parser.add_argument('--resample_every_n_step', type=int, default=10)
 parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--eval_batch_size', type=int, default=32)
+parser.add_argument('--eval_every', type=int, default=20)
 parser.add_argument('--resume_from_ckpt', type=str, default=None)
 parser.add_argument('--wandb', dest='use_wandb', action='store_true', help="Enable wandb logging")
 parser.add_argument('--no-wandb', dest='use_wandb', action='store_false', help="Disable wandb logging")
@@ -106,9 +108,9 @@ cfg = {'tokens': 2,
        'model': {'hidden_size': 64, 'n_blocks': 4, 'n_heads': 4, 'length': D, 
                  'use_checkpoint': False, 'dtype': 'bfloat16'},
        'num_epochs': args.num_epochs,
-       'resample_every_n_step': 10,
+       'resample_every_n_step': args.resample_every_n_step,
        'batch_size': args.batch_size, 
-       'eval_every': 20,
+       'eval_every': args.eval_every,
        'eval_batch_size': args.eval_batch_size,
        'grad_clip': False, 'gradnorm_clip': 1,
        'loss_fn': 'wdce',

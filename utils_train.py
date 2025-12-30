@@ -532,7 +532,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                 x_spins = 2 * x - 1
                 s = ising2d_mag(x_spins)
                 bias_potential.update(s)
-                
+
         # Synchronize loss across processes
         
         logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model,
