@@ -33,6 +33,7 @@ parser.add_argument('--resample_every_n_step', type=int, default=10)
 parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--eval_batch_size', type=int, default=32)
 parser.add_argument('--eval_every', type=int, default=20)
+parser.add_argument('--loss_fn', type=str, default='wdce')
 parser.add_argument('--resume_from_ckpt', type=str, default=None)
 parser.add_argument('--wandb', dest='use_wandb', action='store_true', help="Enable wandb logging")
 parser.add_argument('--no-wandb', dest='use_wandb', action='store_false', help="Disable wandb logging")
@@ -113,7 +114,7 @@ cfg = {'tokens': 2,
        'eval_every': args.eval_every,
        'eval_batch_size': args.eval_batch_size,
        'grad_clip': False, 'gradnorm_clip': 1,
-       'loss_fn': 'wdce',
+       'loss_fn': args.loss_fn,
        'wdce_num_replicates': 8,
        'seed': None,
        'temps': temps,

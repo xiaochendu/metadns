@@ -110,7 +110,10 @@ def loss_lv(log_rnd):
 
 def loss_re_rf(log_rnd, const=0):
     r"""Relative entropy loss KL(P^u||P^*) with REINFORCE trick"""
-    return (-log_rnd * (-log_rnd.detach() + const)).mean()
+    reward_term = (-log_rnd.detach() + const)
+    reward_mean = reward_term.mean()
+    reward_var = reward_term.var()
+    return (-log_rnd * (reward_term - reward_mean) / (reward_var + 1e-8)).mean()
 
 
 def loss_wdce(model, log_rnd, x, num_replicates=16, weight_func=lambda l: 1/l, beta_batch=None, h_batch=None):
@@ -507,8 +510,10 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                                      beta_batch=beta_batch, h_batch=h_batch, J=args.J if hasattr(args, 'J') else 1)
                     ema.restore(model.parameters())
                     x_saved, log_rnd_saved = x, log_rnd
+                    is_fresh_sample = True
                 else:
                     x, log_rnd = x_saved, log_rnd_saved
+                    is_fresh_sample = False
 
             # Note: train_ddp doesn't have multi-temp/field setup, so pass None
             loss = loss_wdce(model, log_rnd, x,
@@ -518,9 +523,12 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
             x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device,
                              beta_batch=beta_batch, h_batch=h_batch, J=args.J if hasattr(args, 'J') else 1)
             loss = loss_fn(log_rnd)
+            is_fresh_sample = True
 
         # Update bias after sampling (on-policy update)
-        if bias_potential is not None:
+        # CRITICAL FIX: Only update bias if we actually generated new samples!
+        # Otherwise we build a huge wall at the same spot for N steps (sloshing).
+        if bias_potential is not None and is_fresh_sample:
             # Calculate CV (Magnetization)
             with torch.no_grad():
                 # x is [B, D] in {0, 1} usually? 
