@@ -65,6 +65,11 @@ parser.add_argument('--kernel_type', type=str, default='gaussian', help='Kernel 
 parser.add_argument('--cv_min', type=float, default=-1.0, help='Minimum value for CV')
 parser.add_argument('--cv_max', type=float, default=1.0, help='Maximum value for CV')
 parser.add_argument('--save_every', type=int, default=10000, help='Save checkpoint every N steps')
+parser.add_argument('--hidden_size', type=int, default=64, help='Model hidden size')
+parser.add_argument('--n_blocks', type=int, default=4, help='Number of transformer blocks')
+parser.add_argument('--n_heads', type=int, default=4, help='Number of attention heads')
+parser.add_argument('--dtype', type=str, default='bfloat16', help='Model data type')
+parser.add_argument('--use_checkpoint', action='store_true', help='Use gradient checkpointing')
 args = parser.parse_args()
 
 if args.use_anneal:
@@ -106,8 +111,8 @@ cfg = {'tokens': 2,
        "beta": beta,
        "J": J,
        "dir_name": args.dir_name,
-       'model': {'hidden_size': 64, 'n_blocks': 4, 'n_heads': 4, 'length': D, 
-                 'use_checkpoint': False, 'dtype': 'bfloat16'},
+       'model': {'hidden_size': args.hidden_size, 'n_blocks': args.n_blocks, 'n_heads': args.n_heads, 'length': D, 
+                 'use_checkpoint': args.use_checkpoint, 'dtype': args.dtype},
        'num_epochs': args.num_epochs,
        'resample_every_n_step': args.resample_every_n_step,
        'batch_size': args.batch_size, 
