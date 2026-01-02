@@ -180,6 +180,18 @@ def run_metadynamics_schedule(args):
         
         beta = 1.0 / T
         
+        # Check if result already exists
+        expected_prior_path = f"{out_prefix}/ising_{args.size}x{args.size}_pots_T{T:.2f}.npy"
+        if Path(expected_prior_path).exists():
+            print(f"  Found existing results for T={T} at {expected_prior_path}. Skipping simulation.")
+            try:
+                vals = np.load(expected_prior_path)
+                final_pots.append(vals)
+                steps_record.append(0) # Unknown steps for resumed run
+                continue
+            except Exception as e:
+                print(f"  Error loading {expected_prior_path}: {e}. Restarting...")
+
         # Initialize Bias for this temperature
         # Range of Magnetization is [-1, 1]
         bias_pot = BinnedBiasPotential(cv_min=-1.0, cv_max=1.0, nbins=args.nbins, device=device)
@@ -188,8 +200,9 @@ def run_metadynamics_schedule(args):
         total_steps_T = 0
         
         # Restart spins for new temp? Or continue from previous?
-        # Usually random or previous is fine.
-        spins = (torch.randint(0, 2, (B, N), device=device) * 2 - 1).float()
+        # Continue from previous
+        # spins = (torch.randint(0, 2, (B, N), device=device) * 2 - 1).float()
+
         
         schedule_step = 0
         
