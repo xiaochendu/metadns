@@ -20,7 +20,8 @@ class BiasPotential:
                  bias_factor, 
                  T, 
                  kernel_type='gaussian',
-                 device='cpu'):
+                 device='cpu',
+                 energy_scaling=1.0):
         """
         Args:
             cv_min (float): Minimum value of the CV (e.g., -1 for magnetization).
@@ -32,6 +33,8 @@ class BiasPotential:
             T (float): Temperature (kB*T units).
             kernel_type (str): 'gaussian' or 'delta'.
             device (str): torch device.
+            energy_scaling (float): Factor to scale delta_T (e.g. system size N).
+                                  Essential for extensive barriers with intensive CVs.
         """
         self.cv_min = cv_min
         self.cv_max = cv_max
@@ -42,6 +45,7 @@ class BiasPotential:
         self.T = T
         self.kernel_type = kernel_type.lower()
         self.device = device
+        self.energy_scaling = energy_scaling
         
         # Initialize grid
         # using linspace for bucket centers
@@ -50,15 +54,12 @@ class BiasPotential:
         
         # Precompute kernel constant for delta_T
         # Delta_T = (gamma - 1) * T
+        # If energy_scaling > 1, we scale Delta_T to allow bias to reach extensive heights
         if self.gamma > 1.0:
-            self.delta_T = (self.gamma - 1) * self.T
+            self.delta_T = (self.gamma - 1) * self.T * self.energy_scaling
         else:
-            # If gamma=1, standard MD (no well-temperedness), effectively infinite delta_T or handled separately
-            # But usually WT means gamma > 1. If gamma=1, bias doesn't decay? 
-            # Actually standard metadynamics is gamma -> infinity.
-            # If gamma = 1, we don't build bias? 
-            # Let's assume user provides valid gamma > 1 for WT.
-            self.delta_T = 1e9 # Large number implies standard metadynamics (W doesn't decay)
+            # If gamma=1, standard MD (no well-temperedness)
+            self.delta_T = 1e9
 
     def _get_gaussian_kernel(self, center):
         """Returns a Gaussian kernel centered at `center` evaluated on the grid."""

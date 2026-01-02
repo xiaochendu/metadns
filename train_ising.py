@@ -70,6 +70,7 @@ parser.add_argument('--n_blocks', type=int, default=4, help='Number of transform
 parser.add_argument('--n_heads', type=int, default=4, help='Number of attention heads')
 parser.add_argument('--dtype', type=str, default='bfloat16', help='Model data type')
 parser.add_argument('--use_checkpoint', action='store_true', help='Use gradient checkpointing')
+parser.add_argument('--scale_bias_with_size', action='store_true', help='Scale bias Delta_T with system size (essential for large L)')
 args = parser.parse_args()
 
 if args.use_anneal:
@@ -137,7 +138,8 @@ cfg = {'tokens': 2,
        'bias_grid_size': args.bias_grid_size,
        'kernel_type': args.kernel_type,
        'save_every': args.save_every,
-       'J': J}
+       'J': J,
+       'scale_bias_with_size': args.scale_bias_with_size}
 
 # Check batch size compatibility if using multiple temps/fields
 if len(temps) > 1 or len(fields) > 1:
@@ -207,7 +209,11 @@ if not args.use_anneal:
     bias_pot = None
     if args.use_bias:
         T_val = 1.0 / args.beta # Usually single beta for bias run
+        energy_scaling_val = float(D) if args.scale_bias_with_size else 1.0
+        
         print(f"Initializing BiasPotential: sigma={args.bias_sigma}, height={args.bias_height}, gamma={args.bias_factor}, type={args.kernel_type}")
+        print(f"Energy scaling factor: {energy_scaling_val} (D={D})")
+        
         bias_pot = BiasPotential(
             cv_min=args.cv_min, cv_max=args.cv_max, 
             grid_size=args.bias_grid_size,
@@ -216,7 +222,8 @@ if not args.use_anneal:
             bias_factor=args.bias_factor,
             T=T_val,
             kernel_type=args.kernel_type,
-            device=device
+            device=device,
+            energy_scaling=energy_scaling_val
         )
         if resume_path is not None and bias_state is not None:
              print("Loading BiasPotential from checkpoint...")
