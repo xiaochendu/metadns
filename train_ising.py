@@ -209,7 +209,8 @@ if not args.use_anneal:
     bias_pot = None
     if args.use_bias:
         T_val = 1.0 / args.beta # Usually single beta for bias run
-        energy_scaling_val = float(D) if args.scale_bias_with_size else 1.0
+        # normalize energy by system size w.r.t. 4x4 Ising model
+        energy_scaling_val = float(D) / 16 if args.scale_bias_with_size else 1.0
         
         print(f"Initializing BiasPotential: sigma={args.bias_sigma}, height={args.bias_height}, gamma={args.bias_factor}, type={args.kernel_type}")
         print(f"Energy scaling factor: {energy_scaling_val} (D={D})")
