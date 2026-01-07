@@ -665,12 +665,27 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                             pass
 
                     # Plot bias analysis during validation (uses eval_batch_size)
-                    if bias_potential is not None:
                         try:
                             # Convert x(0,1) to spins(-1,1) for CV
                             x_spins_eval = 2 * x - 1
                             s_eval = ising2d_mag(x_spins_eval)
-                            fig_bias = plot_bias_analysis(bias_potential, epoch, s_batch=s_eval)
+                            
+                            # Compute biased reward: R_biased = R_unbiased - beta * V(s)
+                            # logf_t_vals contains R_unbiased values for the batch
+                            
+                            # Get V(s)
+                            with torch.no_grad():
+                                v_eval = bias_potential.evaluate(s_eval.to(device))
+                                
+                                # Get beta (use eval_beta_batch if available, else 1/T from bias_pot)
+                                if eval_beta_batch is not None:
+                                    beta_val = eval_beta_batch
+                                else:
+                                    beta_val = 1.0 / bias_potential.T
+                                    
+                                biased_reward_vals = logf_t_vals - beta_val * v_eval
+                                
+                            fig_bias = plot_bias_analysis(bias_potential, epoch, s_batch=s_eval, biased_reward=biased_reward_vals)
                             if fig_bias is not None:
                                 wandb_run.log({"val/bias_analysis_plot": wandb.Image(fig_bias)}, step=epoch)
                                 plt.close(fig_bias)

@@ -114,17 +114,20 @@ def cycleloader(dataloader):
             yield data
 
 
-def plot_bias_analysis(bias_potential, epoch, s_batch=None):
+def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None):
     """
     Plots bias analysis:
     1. Estimated Free Energy F(s) (from Bias Potential)
     2. Raw Histogram P(s) (from batch) - Checks sampling uniformity
     3. Reweighted Histogram P_corr(s) (Likely physical F(s))
+    4. Log-Ratio (log_rnd) vs CV (Optional) - Checks convergence
     
     s_batch: Tensor/Array of CV values from current batch
+    log_rnd: Tensor/Array of log-RND values (log R_biased - log P_model)
     """
     try:
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        axes = axes.flatten()
         
         # 1. Estimated Free Energy from Bias
         # F(s) ~ - (gamma / (gamma - 1)) * V(s)
@@ -177,13 +180,40 @@ def plot_bias_analysis(bias_potential, epoch, s_batch=None):
                 v_s = bias_potential.evaluate(s_tens) # [B]
                 # beta = 1/T
                 beta = 1.0 / bias_potential.T
-                weights = torch.exp(beta * v_s).cpu().numpy()
+                log_weights = beta * v_s
+                # Shift for numerical stability
+                log_weights = log_weights - log_weights.max()
+                weights = torch.exp(log_weights).cpu().numpy()
             
             axes[2].hist(s_np, bins=bias_potential.grid_size, range=(-1, 1), density=True, weights=weights, alpha=0.6, color='red', label='Reweighted')
             axes[2].set_title('Corrected Distribution P(s) (Physical)')
             axes[2].set_xlabel('CV')
             axes[2].set_ylabel('Density')
+            axes[2].set_ylabel('Density')
             axes[2].grid(True)
+            
+            # 4. Biased Reward vs CV
+            # This is the target landscape the model is trying to learn
+            # Ideally should be flat(ter) than the original energy landscape
+            if biased_reward is not None:
+                if isinstance(biased_reward, torch.Tensor):
+                    r_np = biased_reward.detach().cpu().numpy()
+                else:
+                    r_np = biased_reward
+                    
+                axes[3].scatter(s_np, r_np, alpha=0.3, s=5, label='Biased Reward')
+                axes[3].set_title('Biased Reward vs CV (Target Landscape)')
+                axes[3].set_xlabel('CV')
+                axes[3].set_ylabel('Energy (-beta*H - beta*V)')
+                axes[3].grid(True)
+            else:
+                axes[3].axis('off')
+
+        else:
+             # Hide unused axes if s_batch missing
+             axes[1].axis('off')
+             axes[2].axis('off')
+             axes[3].axis('off')
 
         plt.tight_layout()
         return fig
