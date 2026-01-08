@@ -20,4 +20,7 @@ dependencies:
       - timm
       - notebook
       - wandb
+      - ase=3.24.0
+      - clease=1.1.0
+      - icet=3.1
 
