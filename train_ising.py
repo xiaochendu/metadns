@@ -3,6 +3,7 @@ from warnings import simplefilter
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
 from model import ExponentialMovingAverage, get_rope_vit_model
 from utils import Dict2Obj, plot_loss_ess
 from utils_ising import ising2d_ham, ising2d_mag, reward_fn_ising
@@ -16,6 +17,7 @@ from pathlib import Path
 from pprint import pformat
 
 import wandb
+
 from bias import BiasPotential
 from utils_ising import ising2d_mag
 
@@ -265,13 +267,20 @@ if not args.use_anneal:
 
     actual_reward_fn = biased_reward_fn if args.use_bias else reward_fn
     
+    # Define CV computation function for Ising
+    def compute_cv_ising(x):
+        """Compute magnetization CV for Ising model."""
+        x_spins = 2 * x - 1  # Convert {0,1} -> {-1,1}
+        return ising2d_mag(x_spins)
+    
     model, optimizer, ema, losses, ess_train, ess_eval = train(
         model, optimizer, actual_reward_fn, 
         Dict2Obj(cfg), device, ema=ema, num_epochs=args.num_epochs,
         losses=losses, ess_train=ess_train, ess_eval=ess_eval,
         wandb_run=wandb_run, L=L, bias_potential=bias_pot,
         current_fields=current_fields, rng=rng,
-        save_dir=dir_name, cfg_dict=cfg)
+        save_dir=dir_name, cfg_dict=cfg,
+        cv_compute_fn=compute_cv_ising)
     
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")

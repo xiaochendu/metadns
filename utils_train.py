@@ -311,7 +311,7 @@ def log_validation_metrics(
 
 
 def _compute_log_stats(x, log_rnd, reward_fn, model, beta_batch=None, h_batch=None, J=1,
-                       bias_potential=None):
+                       bias_potential=None, cv_compute_fn=None):
     """Compute logf_t and logp_x given samples and RND values.
     
     Args:
@@ -340,8 +340,13 @@ def _compute_log_stats(x, log_rnd, reward_fn, model, beta_batch=None, h_batch=No
     # assuming logf_t_vals is unbiased (which it is, see use_bias=False above)
     if bias_potential is not None:
         with torch.no_grad():
-            x_spins = 2 * x - 1
-            s = ising2d_mag(x_spins)
+            if cv_compute_fn is not None:
+                s = cv_compute_fn(x)  # Use provided CV computation function
+            else:
+                # Backward compatible: default to Ising magnetization
+                x_spins = 2 * x - 1
+                s = ising2d_mag(x_spins)
+
             bias_vals = bias_potential.evaluate(s) # [B]
             
             # Apply beta correction
@@ -448,7 +453,7 @@ def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16,
 def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=None,
           losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None, 
           bias_potential=None, current_fields=None, rng=None, save_dir=None, cfg_dict=None,
-          validation_plot_callback=None):
+          validation_plot_callback=None, cv_compute_fn=None):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
                'wdce': loss_wdce}.get(args.loss_fn)
     if loss_fn is None:
@@ -569,16 +574,20 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
         # CRITICAL FIX: Only update bias if we actually generated new samples!
         # Otherwise we build a huge wall at the same spot for N steps (sloshing).
         if bias_potential is not None and is_fresh_sample:
-            # Calculate CV (Magnetization)
+            # Calculate CV (Magnetization for Ising, Concentration for CuAu, etc.)
             with torch.no_grad():
-                # x is [B, D] in {0, 1} usually? 
-                # utils_ising functions usually expect {-1, 1} but handle it?
-                # train_ising.py reward_fn converts 0/1 to -1/1.
-                # ising2d_mag inside utils_ising expects {-1, 1}
-                # rnd returns x in {0..(vocab-1)}. For Ising vocab=2 (0, 1).
-                # So we must convert to spins for ising2d_mag: 2*x - 1
-                x_spins = 2 * x - 1
-                s = ising2d_mag(x_spins)
+                if cv_compute_fn is not None:
+                    s = cv_compute_fn(x)  # Use provided CV computation function
+                else:
+                    # Backward compatible: default to Ising magnetization
+                    # x is [B, D] in {0, 1} usually? 
+                    # utils_ising functions usually expect {-1, 1} but handle it?
+                    # train_ising.py reward_fn converts 0/1 to -1/1.
+                    # ising2d_mag inside utils_ising expects {-1, 1}
+                    # rnd returns x in {0..(vocab-1)}. For Ising vocab=2 (0, 1).
+                    # So we must convert to spins for ising2d_mag: 2*x - 1
+                    x_spins = 2 * x - 1
+                    s = ising2d_mag(x_spins)
                 bias_potential.update(s)
 
         # Synchronize loss across processes
@@ -586,7 +595,8 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
         logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model,
                                                        beta_batch=beta_batch, h_batch=h_batch,
                                                        J=args.J if hasattr(args, 'J') else 1,
-                                                       bias_potential=bias_potential)
+                                                       bias_potential=bias_potential,
+                                                       cv_compute_fn=cv_compute_fn)
         vfe = logp_x_vals - logf_t_vals  # variational free energy
         ess_train.append(ess(log_rnd))
         info['ess_train'] = ess_train[-1]
@@ -680,7 +690,8 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                     logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model,
                                                                    beta_batch=eval_beta_batch, h_batch=eval_h_batch,
                                                                    J=args.J if hasattr(args, 'J') else 1,
-                                                                   bias_potential=bias_potential)
+                                                                   bias_potential=bias_potential,
+                                                                   cv_compute_fn=cv_compute_fn)
                     vfe = logp_x_vals - logf_t_vals  # variational free energy
                     
                     # Use the new per-condition logging function (similar to snowyflow)
@@ -744,9 +755,13 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                     # Plot bias analysis during validation (uses eval_batch_size)
                     if bias_potential is not None:
                         try:
-                            # Convert x(0,1) to spins(-1,1) for CV
-                            x_spins_eval = 2 * x - 1
-                            s_eval = ising2d_mag(x_spins_eval)
+                            # Compute CV using provided function or default to Ising
+                            if cv_compute_fn is not None:
+                                s_eval = cv_compute_fn(x)  # Use provided CV computation function
+                            else:
+                                # Backward compatible: default to Ising magnetization
+                                x_spins_eval = 2 * x - 1
+                                s_eval = ising2d_mag(x_spins_eval)
                             
                             # Compute biased reward: R_biased = R_unbiased - beta * V(s)
                             # logf_t_vals contains R_unbiased values for the batch

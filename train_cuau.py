@@ -117,7 +117,12 @@ class CuAuRewardWrapper:
         self.vocab_map = vocab_map # Map 0->Cu(29), 1->Au(79)
         self.default_temp_k = default_temp_k  # Store default temp for single-temp case
 
-    def __call__(self, x, beta=None, h=None, J=1, use_bias=True):
+    def __call__(self, x, beta=None, h=None, J=1, use_bias=False, bias_potential=None, cv_compute_fn=None):
+        """
+        Args:
+            bias_potential: BiasPotential instance (optional, for metadynamics)
+            cv_compute_fn: Function to compute CV from x (optional, for bias)
+        """
         # x is [B, L] indices (0, 1). MASK (2) should not remain in final samples.
         # AuCuAlloyModel expects {0, 1} inputs and maps internally.
         
@@ -158,6 +163,32 @@ class CuAuRewardWrapper:
         # For CuAu: H_eff = E - h*M, so log_reward = -beta*(E - h*M) = -(E - h*M)/(kB*T)
         free_energies = self.energy_model(x, temps, fields)  # [B] = (E - h*M)/(kB*T)
         log_reward = -free_energies
+        
+        # Add Bias: R' = R - beta * V(s)
+        if bias_potential is not None and use_bias and cv_compute_fn is not None:
+            # Compute CV (Au concentration)
+            s = cv_compute_fn(x)  # [B]
+            v = bias_potential.evaluate(s)  # [B]
+            
+            # Get beta for scaling
+            if beta is None:
+                # Use default temp to compute beta
+                if self.default_temp_k is not None:
+                    beta_val = 1.0 / (K_B * self.default_temp_k)
+                else:
+                    beta_val = 1.0  # Fallback
+            elif isinstance(beta, torch.Tensor):
+                beta_val = beta.to(x.device)
+            else:
+                beta_val = torch.tensor(beta, device=x.device)
+            
+            # Apply bias: subtract beta * V(s)
+            if isinstance(beta_val, torch.Tensor):
+                if beta_val.dim() == 0:
+                    beta_val = beta_val.expand(x.shape[0])
+                log_reward = log_reward - beta_val * v
+            else:
+                log_reward = log_reward - beta_val * v
 
         return log_reward
 
@@ -204,8 +235,8 @@ def get_args():
     parser.add_argument("--bias_height", type=float, default=0.1)
     parser.add_argument("--bias_factor", type=float, default=10.0)
     parser.add_argument("--bias_grid_size", type=int, default=100)
-    parser.add_argument("--cv_min", type=float, default=-1.0)
-    parser.add_argument("--cv_max", type=float, default=1.0)
+    parser.add_argument("--cv_min", type=float, default=0.0, help="Minimum CV value (default: 0.0 for Au concentration)")
+    parser.add_argument("--cv_max", type=float, default=1.0, help="Maximum CV value (default: 1.0 for Au concentration)")
     parser.add_argument("--scale_bias_with_size", action="store_true")
     
     # Logging
@@ -283,7 +314,14 @@ def main():
     # For single temp case, store the temperature so we can compute beta when it's None
     # For single temp: temp_min == temp_max, so use temp_min
     default_temp = args.temp_min if args.num_temps == 1 else None
-    reward_fn = CuAuRewardWrapper(energy_model, default_temp_k=default_temp)
+    
+    # Create CV computation function for CuAu (Au concentration)
+    def compute_cv_cuau(x):
+        """Compute Au concentration CV for CuAu alloy."""
+        return energy_model.get_concentrations(x)
+    
+    # Create base reward function (will be wrapped with bias if enabled)
+    reward_fn_base = CuAuRewardWrapper(energy_model, default_temp_k=default_temp)
 
     # 3. Setup Neural Model
     # Determine reference positions for RoPE
@@ -329,23 +367,44 @@ def main():
     if args.use_bias:
         D = num_sites
         energy_scaling_val = float(D) / 16.0 if args.scale_bias_with_size else 1.0
-        T_val = args.temp_max # Reference T
+        T_kelvin = args.temp_max  # Reference T in Kelvin
         
-        print(f"Initializing Bias: sigma={args.bias_sigma}, factor={args.bias_factor}")
+        # BiasPotential expects T in kB*T units (energy units)
+        # For CuAu: T (in Kelvin) -> kB*T (in eV) = kB * T_Kelvin
+        # K_B is already imported from ase.units (eV/K)
+        T_val = K_B * T_kelvin  # Convert Kelvin to energy (eV)
+        
+        # For CuAu, CV is Au concentration [0, 1]
+        # Allow override via args, but default to [0, 1] for CuAu
+        cv_min = args.cv_min  # Default 0.0 for concentration
+        cv_max = args.cv_max  # Default 1.0 for concentration
+        
+        print(f"Initializing Bias: sigma={args.bias_sigma}, factor={args.bias_factor}, CV range=[{cv_min}, {cv_max}]")
+        print(f"Temperature: {T_kelvin} K = {T_val:.6f} eV (kB*T)")
         
         kernel_type = "delta" if args.bias_method == "binned" else "gaussian"
         bias_potential = BiasPotential(
-            cv_min=args.cv_min,
-            cv_max=args.cv_max,
+            cv_min=cv_min,
+            cv_max=cv_max,
             grid_size=args.bias_grid_size,
             sigma=args.bias_sigma,
             initial_height=args.bias_height,
             bias_factor=args.bias_factor,
-            T=T_val,
+            T=T_val,  # Temperature in kB*T units (eV)
             kernel_type=kernel_type,
             device=device,
             energy_scaling=energy_scaling_val
         )
+        
+        # Create biased reward function now that bias_potential exists
+        def create_biased_reward_fn(base_reward, bias_pot, cv_fn):
+            def biased_reward(x, beta=None, h=None, J=1, use_bias=True):
+                return base_reward(x, beta=beta, h=h, J=J, use_bias=use_bias,
+                                  bias_potential=bias_pot, cv_compute_fn=cv_fn)
+            return biased_reward
+        reward_fn = create_biased_reward_fn(reward_fn_base, bias_potential, compute_cv_cuau)
+    else:
+        reward_fn = reward_fn_base
 
     # 5. Load Checkpoint
     checkpoint = (
@@ -420,6 +479,7 @@ def main():
         save_dir=args.out_dir,
         cfg_dict=vars(args),
         validation_plot_callback=validation_plot_callback,
+        cv_compute_fn=compute_cv_cuau,
     )
 
 if __name__ == "__main__":

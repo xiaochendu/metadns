@@ -174,7 +174,7 @@ def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None):
                 s_np = s_batch
                 
             # Histogram
-            axes[1].hist(s_np, bins=bias_potential.grid_size, range=(-1, 1), density=True, alpha=0.6, color='green', label='Sampled')
+            axes[1].hist(s_np, bins=bias_potential.grid_size, range=(bias_potential.cv_min, bias_potential.cv_max), density=True, alpha=0.6, color='green', label='Sampled')
             axes[1].set_title('Raw Distribution P(s) (Should be Flat)')
             axes[1].set_xlabel('CV')
             axes[1].set_ylabel('Density')
@@ -199,7 +199,7 @@ def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None):
                 log_weights = log_weights - log_weights.max()
                 weights = torch.exp(log_weights).cpu().numpy()
             
-            axes[2].hist(s_np, bins=bias_potential.grid_size, range=(-1, 1), density=True, weights=weights, alpha=0.6, color='red', label='Reweighted')
+            axes[2].hist(s_np, bins=bias_potential.grid_size, range=(bias_potential.cv_min, bias_potential.cv_max), density=True, weights=weights, alpha=0.6, color='red', label='Reweighted')
             axes[2].set_title('Corrected Distribution P(s) (Physical)')
             axes[2].set_xlabel('CV')
             axes[2].set_ylabel('Density')
