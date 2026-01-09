@@ -149,7 +149,6 @@ class MultiOutputTransformer(nn.Module):
              field = field[..., 0:1]
 
         thermo_params = torch.cat([temp, field], dim=-1) # (B, 2)
-        breakpoint()
         cond_embed = self.thermo_embedder(thermo_params) # (B, D)
         
         # Add conditioning to node embeddings
@@ -168,6 +167,9 @@ class MultiOutputTransformer(nn.Module):
         # 4. Outputs
         # Node-level scalars (logits)
         logits = self.scalar_head(h) # (B, L, num_scalars)
+        # Apply log_softmax to convert to log probabilities (consistent with vit_rope)
+        # Note: utils_train will strip the last dimension (mask token) before sampling
+        log_probs = F.log_softmax(logits, dim=-1) # (B, L, num_scalars)
 
         # Graph-level marginal
         # Aggregation
@@ -180,6 +182,6 @@ class MultiOutputTransformer(nn.Module):
         marginal = self.marginal_head(h_graph) # (B, num_marginal)
 
         return {
-            "scalars": logits,   # (B, L, 1) usually
-            "marginal": marginal, # (B, 1) usually
+            "scalars": log_probs,   # (B, L, num_scalars) - log probabilities
+            "marginal": marginal, # (B, num_marginal)
         }

@@ -8,8 +8,16 @@ import torch.distributed as dist
 import wandb
 from matplotlib.colors import ListedColormap
 from tqdm import tqdm
+
 from utils import ess, plot_bias_analysis, sample_categorical_logits
 from utils_ising import ising2d_mag
+
+# Import kB for temperature conversion
+try:
+    import ase.units
+    K_B = ase.units.kB  # eV/K
+except ImportError:
+    K_B = 8.617333262e-5  # eV/K (fallback)
 
 
 def save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg, path, bias_potential=None):
@@ -56,12 +64,26 @@ def rnd(model, reward_model, batch_size, device='cuda:0', beta_batch=None, h_bat
             logits = model(x, beta=beta_batch, h=h_batch)[:, :, :-1] # [B, D, N-1]
         else:
             logits = model(x)[:, :, :-1] # [B, D, N-1] - backward compatible
+        
+        # Both vit_rope (Ising) and MultiOutputTransformer (CuAu) now return log probabilities
+        # For backward compatibility with old models that might return raw logits, check and convert if needed
+        if (logits > 0).any():
+            # Raw logits detected (old model format) - apply log_softmax to get log probabilities
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            # For sampling, we can use either raw logits or log_probs with Gumbel-max
+            # Using raw logits is more standard, but log_probs also works (argmax is shift-invariant)
+            logits_for_sampling = logits
+        else:
+            # Already log probabilities (expected for modern models: vit_rope and MultiOutputTransformer)
+            log_probs = logits
+            logits_for_sampling = logits
+        
         update = sample_categorical_logits(
-            logits[batch_arange, jump_pos[:, d]]) # [B]
+            logits_for_sampling[batch_arange, jump_pos[:, d]]) # [B]
         if torch.is_grad_enabled(): # avoid issues with in-place operations
             x = x.clone()
         x[batch_arange, jump_pos[:, d]] = update
-        log_rnd += -np.log(model.vocab_size-1) - logits[batch_arange, jump_pos[:, d], update]
+        log_rnd += -np.log(model.vocab_size-1) - log_probs[batch_arange, jump_pos[:, d], update]
     
     # Compute reward with per-sample temperatures/fields if provided
     if beta_batch is not None or h_batch is not None:
@@ -74,7 +96,7 @@ def rnd(model, reward_model, batch_size, device='cuda:0', beta_batch=None, h_bat
     else:
         # Backward compatible: use default scalar values
         log_rnd += reward_model(x) # [B]
-    
+
     return x, log_rnd
 
 
@@ -183,6 +205,7 @@ def log_validation_metrics(
     beta_batch: Optional[torch.Tensor],
     h_batch: Optional[torch.Tensor],
     step: int,
+    log_rnd: Optional[torch.Tensor] = None,
     log_kwargs: Optional[dict] = None,
 ) -> None:
     """Log validation metrics per condition and overall, similar to snowyflow.
@@ -195,6 +218,7 @@ def log_validation_metrics(
         beta_batch: Beta values [B] or None for single condition
         h_batch: Field values [B] or None for single condition
         step: Step/epoch number for logging
+        log_rnd: Log RND values, shape [B] (optional)
         log_kwargs: Additional keyword arguments to pass to wandb.log
     """
     if log_kwargs is None:
@@ -239,6 +263,14 @@ def log_validation_metrics(
         conditions_log_data[f"logp_x_std/{condition_name}"] = logp_x_cond.std().item()
         conditions_log_data[f"vfe_mean/{condition_name}"] = vfe_cond.mean().item()
         conditions_log_data[f"vfe_std/{condition_name}"] = vfe_cond.std().item()
+        
+        # Log log_rnd per condition if provided
+        if log_rnd is not None:
+            log_rnd_cond = log_rnd[mask]
+            conditions_log_data[f"log_rnd_mean/{condition_name}"] = log_rnd_cond.mean().item()
+            conditions_log_data[f"log_rnd_std/{condition_name}"] = log_rnd_cond.std().item()
+            conditions_log_data[f"log_rnd_min/{condition_name}"] = log_rnd_cond.min().item()
+            conditions_log_data[f"log_rnd_max/{condition_name}"] = log_rnd_cond.max().item()
     
     # Log temperature and field statistics to conditions panel (only if they vary)
     if beta_batch is not None:
@@ -260,6 +292,13 @@ def log_validation_metrics(
     val_log_data["logp_x_std/overall"] = logp_x.std().item()
     val_log_data["vfe_mean/overall"] = vfe.mean().item()
     val_log_data["vfe_std/overall"] = vfe.std().item()
+    
+    # Log log_rnd overall statistics if provided
+    if log_rnd is not None:
+        val_log_data["log_rnd_mean/overall"] = log_rnd.mean().item()
+        val_log_data["log_rnd_std/overall"] = log_rnd.std().item()
+        val_log_data["log_rnd_min/overall"] = log_rnd.min().item()
+        val_log_data["log_rnd_max/overall"] = log_rnd.max().item()
     
     # Prefix keys appropriately for separate panels
     val_log_data_prefixed = {f"val/{k}": v for k, v in val_log_data.items()}
@@ -408,7 +447,8 @@ def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16,
 
 def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=None,
           losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None, 
-          bias_potential=None, current_fields=None, rng=None, save_dir=None, cfg_dict=None):
+          bias_potential=None, current_fields=None, rng=None, save_dir=None, cfg_dict=None,
+          validation_plot_callback=None):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
                'wdce': loss_wdce}.get(args.loss_fn)
     if loss_fn is None:
@@ -562,6 +602,10 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                 "train/std_logp_x": logp_x_vals.std().item(),
                 "train/avg_logf_t": logf_t_vals.mean().item(),
                 "train/std_logf_t": logf_t_vals.std().item(),
+                "train/avg_log_rnd": log_rnd.mean().item(),
+                "train/std_log_rnd": log_rnd.std().item(),
+                "train/min_log_rnd": log_rnd.min().item(),
+                "train/max_log_rnd": log_rnd.max().item(),
             }
             
             # Log bias stats
@@ -647,11 +691,44 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                         vfe=vfe,
                         beta_batch=eval_beta_batch,
                         h_batch=eval_h_batch,
+                        log_rnd=log_rnd,
                         step=epoch,
                     )
                     
-                    # Also log ESS (not included in per-condition metrics)
+                    # Also log ESS (log_rnd stats are included in log_validation_metrics)
                     wandb_run.log({"val/ess": eval_ess}, step=epoch)
+                    
+                    # Call validation plotting callback if provided
+                    if validation_plot_callback is not None:
+                        try:
+                            # Convert beta/h to temps/fields for plotting
+                            if eval_beta_batch is not None:
+                                # beta = 1/(kB*T), so T = 1/(kB*beta)
+                                if isinstance(eval_beta_batch, torch.Tensor):
+                                    plot_temps = 1.0 / (eval_beta_batch * K_B)
+                                else:
+                                    plot_temps = torch.full((x.shape[0],), 1.0 / (eval_beta_batch * K_B), device=device, dtype=torch.float32)
+                            else:
+                                # Single temp case - need to get from args or use default
+                                if hasattr(args, 'temp_min') and args.num_temps == 1:
+                                    plot_temps = torch.full((x.shape[0],), args.temp_min, device=device, dtype=torch.float32)
+                                else:
+                                    plot_temps = torch.ones(x.shape[0], device=device, dtype=torch.float32)
+                            
+                            if eval_h_batch is not None:
+                                plot_fields = eval_h_batch
+                            else:
+                                plot_fields = torch.zeros(x.shape[0], device=device, dtype=torch.float32)
+                            
+                            validation_plot_callback(
+                                x=x,
+                                temps=plot_temps,
+                                fields=plot_fields,
+                                wandb_run=wandb_run,
+                                step=epoch,
+                            )
+                        except Exception as e:
+                            logging.warning(f"Validation plotting callback failed: {e}")
                     
                     # Log lattice visualization during evaluation
                     if L is not None:
@@ -665,6 +742,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                             pass
 
                     # Plot bias analysis during validation (uses eval_batch_size)
+                    if bias_potential is not None:
                         try:
                             # Convert x(0,1) to spins(-1,1) for CV
                             x_spins_eval = 2 * x - 1

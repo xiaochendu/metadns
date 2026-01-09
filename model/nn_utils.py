@@ -454,6 +454,8 @@ class RotaryPositionalEncoding(nn.Module):
         #                 = positions ⊗ ([0,1,2,...] * 2π/period)  ✓
 
         num_atoms = rope_module.max_seq_len
+        # Ensure positions_1d is on the same device as rope_module.theta
+        positions_1d = positions_1d.to(rope_module.theta.device)
         scaled_positions = positions_1d * (num_atoms / period)
 
         # Build RoPE cache: idx_theta = scaled_positions ⊗ theta

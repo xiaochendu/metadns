@@ -14,13 +14,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import utils_train
 import wandb
 from ase import Atoms
+
+import utils_train
 from bias import BiasPotential
 from energy_cuau import AuCuAlloyModel
 from model import ExponentialMovingAverage
 from model.transformer import MultiOutputTransformer
+from utils import plot_energy_au_conc_distributions
+
+K_B = ase.units.kB  # eV/K
 
 # Try to import clease/icet for setup
 try:
@@ -83,12 +87,10 @@ class TransformerWrapper(nn.Module):
             
         outputs = self.model(x, temp=temp, field=field)
         
-        # utils_train expects logits [B, L, vocab_size] (or [B, L, vocab_size-1]?)
-        # MultiOutputTransformer with num_scalars=3 returns [B, L, 3].
-        # utils_train usually strips last dim if it expects to sample from valid tokens only?
-        # utils_train.rnd: logits = model(x)[:, :, :-1]
-        # It assumes the last token is MASK and shouldn't be sampled.
-        # So we should return full logits [B, L, 3], and utils_train will strip the last one.
+        # MultiOutputTransformer now returns log probabilities [B, L, vocab_size] (like vit_rope)
+        # utils_train expects log probabilities [B, L, vocab_size] and will strip the last dimension
+        # (mask token) before sampling: logits = model(x)[:, :, :-1]
+        # So we return full log probabilities [B, L, 3] (Cu=0, Au=1, Mask=2), and utils_train strips Mask.
         
         return outputs['scalars']
 
@@ -104,62 +106,58 @@ class CuAuRewardWrapper:
     
     Signature: reward_fn(x, beta=None, h=None, J=1, use_bias=True) -> log_reward [B]
     """
-    def __init__(self, energy_model, vocab_map={0: 29, 1: 79}):
+    def __init__(self, energy_model, vocab_map={0: 29, 1: 79}, default_temp_k=None):
+        """
+        Args:
+            energy_model: AuCuAlloyModel instance
+            vocab_map: Mapping from vocab indices to atomic numbers
+            default_temp_k: Default temperature in Kelvin for single-temp case (when beta is None)
+        """
         self.energy_model = energy_model
         self.vocab_map = vocab_map # Map 0->Cu(29), 1->Au(79)
+        self.default_temp_k = default_temp_k  # Store default temp for single-temp case
 
     def __call__(self, x, beta=None, h=None, J=1, use_bias=True):
         # x is [B, L] indices (0, 1). MASK (2) should not remain in final samples.
         # AuCuAlloyModel expects {0, 1} inputs and maps internally.
         
-        # Calculate Energy (in eV usually)
-        energies = self.energy_model.get_energy(x) # [B]
+        # Convert beta to temperature in Kelvin
+        # beta = 1/(kB*T), so T = 1/(kB*beta)
         
-        # Calculate Log Reward: -beta * E
         if beta is None:
-             # If no beta provided, assume beta=1 or use model's default?
-             # For CuAu, temperatures are real (K). 
-             # self.energy_model.k_b is available.
-             # If beta is raw inverse temperature (1/kT or 1/T?)
-             # utils_train usually assumes dimensionless beta * E.
-             # If 'beta' passed from train is actually 1/T_kelvin:
-             # log_reward = - (1/T) * E_eV / k_B_eV_per_K ?
-             # train passes 'beta' which comes from args.temps (usually inverse temp).
-             # Let's assume train passes valid beta.
-             # If beta is None, we need a default.
-             beta = 1.0 # Placeholder
-        breakpoint()
-        if isinstance(beta, torch.Tensor):
-            beta = beta.to(energies.device)
-            
-        # log_reward = - beta * energy
-        # Note: interactions 'J' usually handled in energy model or ignored here.
-        # 'h' (field) might correspond to chemical potential difference.
-        # If 'h' is used, typical Grand Canonical: E - mu * N
-        # For CuAu (fixed size, changing concentration), mu is chem pot diff.
-        # E_eff = E - h * (Concentration or Magnetization)
-        # Magnetization = (2*x - 1). 
-        # utils_train usually passes 'h' to model and reward.
+            # Single temp/field case: utils_train doesn't pass beta
+            # Use stored default temperature
+            if self.default_temp_k is not None:
+                temps = torch.full((x.shape[0],), self.default_temp_k, device=x.device, dtype=torch.float32)
+            else:
+                # Fallback: assume T=1K (shouldn't happen if default_temp_k is set)
+                temps = torch.ones(x.shape[0], device=x.device, dtype=torch.float32)
+        else:
+            # Convert beta to temperature: T = 1/(kB*beta)
+            if isinstance(beta, torch.Tensor):
+                beta = beta.to(x.device)
+                temps = 1.0 / (K_B * beta)
+            else:
+                temps = torch.full((x.shape[0],), 1.0 / (K_B * beta), device=x.device, dtype=torch.float32)
         
-        log_reward = -beta * energies
-        
-        if h is not None:
-             # Add chemical potential term if h provided
-             # h * magnetization
-             if isinstance(h, torch.Tensor):
-                 h = h.to(energies.device)
-             
-             # Mag: sum(2*x - 1) or mean?
-             # Usually standard Ising: -E + h*M.
-             # Here log_reward ~ -E + h*M = -(E - h*M)
-             # So we ADD h*M to log_reward (since log_p ~ -E)
-             # Check signs carefully.
-             # Ising: E = -J sum ss - h sum s. P ~ exp(-beta E) = exp(beta J ss + beta h s).
-             # So log_reward += beta * h * sum(s)
-             
-             # M = sum(2*x - 1)
-             m = (2 * x - 1).float().sum(dim=-1)
-             log_reward += beta * h * m
+        # Handle field: h is in energy units (eV), use directly as fields
+        if h is None:
+            fields = torch.zeros(x.shape[0], device=x.device, dtype=torch.float32)
+        else:
+            if isinstance(h, torch.Tensor):
+                fields = h.to(x.device)
+                if fields.dim() == 0:
+                    fields = fields.expand(x.shape[0])
+            else:
+                fields = torch.full((x.shape[0],), float(h), device=x.device, dtype=torch.float32)
+        # Get free energies in units of kB*T (dimensionless)
+        # get_free_energies returns (E - fields * lattices_factor) / (kB*T)
+        # where E is formation energy (relative to pure phases), lower is better
+        # For Boltzmann: P(x) ∝ exp(-beta * H) where H is the effective energy
+        # In Ising: H = -J*sum(s_i*s_j) - h*sum(s_i), reward = -beta*H
+        # For CuAu: H_eff = E - h*M, so log_reward = -beta*(E - h*M) = -(E - h*M)/(kB*T)
+        free_energies = self.energy_model(x, temps, fields)  # [B] = (E - h*M)/(kB*T)
+        log_reward = -free_energies
 
         return log_reward
 
@@ -180,16 +178,16 @@ def get_args():
     
     # Training Config (utils_train compatible)
     parser.add_argument("--loss_fn", type=str, default="wdce", choices=["ce", "lv", "wdce", "re_rf"])
-    parser.add_argument("--batch_size", type=int, default=100)
-    parser.add_argument("--eval_batch_size", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--eval_batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--n_steps", type=int, default=100000) # num_epochs in train
-    parser.add_argument("--resample_every_n_step", type=int, default=1000)
-    parser.add_argument("--wdce_num_replicates", type=int, default=4, help="Replicates for WDCE")
+    parser.add_argument("--resample_every_n_step", type=int, default=10)
+    parser.add_argument("--wdce_num_replicates", type=int, default=8, help="Replicates for WDCE")
     parser.add_argument("--grad_clip", action="store_true")
     parser.add_argument("--gradnorm_clip", type=float, default=1.0)
-    parser.add_argument("--save_every", type=int, default=5000)
-    parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate every N steps")
+    parser.add_argument("--save_every", type=int, default=10000)
+    parser.add_argument("--eval_every", type=int, default=20, help="Evaluate every N steps")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from_ckpt", type=str, default=None)
     
@@ -203,7 +201,7 @@ def get_args():
     parser.add_argument("--use_bias", action="store_true", help="Use metadynamics bias")
     parser.add_argument("--bias_method", type=str, default="binned", choices=["binned", "gaussian"])
     parser.add_argument("--bias_sigma", type=float, default=0.05)
-    parser.add_argument("--bias_height", type=float, default=0.01)
+    parser.add_argument("--bias_height", type=float, default=0.1)
     parser.add_argument("--bias_factor", type=float, default=10.0)
     parser.add_argument("--bias_grid_size", type=int, default=100)
     parser.add_argument("--cv_min", type=float, default=-1.0)
@@ -282,8 +280,11 @@ def main():
     num_sites = energy_model.num_sites
     
     # 2. Setup Reward Function Wrapper
-    reward_fn = CuAuRewardWrapper(energy_model)
-    
+    # For single temp case, store the temperature so we can compute beta when it's None
+    # For single temp: temp_min == temp_max, so use temp_min
+    default_temp = args.temp_min if args.num_temps == 1 else None
+    reward_fn = CuAuRewardWrapper(energy_model, default_temp_k=default_temp)
+
     # 3. Setup Neural Model
     # Determine reference positions for RoPE
     if hasattr(energy_model, "atoms"):
@@ -293,10 +294,10 @@ def main():
     
     fixed_positions = None
     if ref_atoms is not None:
+        # Don't move to device here - let the model move it when .to(device) is called
         fixed_positions = torch.tensor(
             ref_atoms.get_scaled_positions(), dtype=torch.float32
-        ).to(device)
-    breakpoint()
+        )
     # Use vocab_size = 3 (Cu=0, Au=1, Mask=2)
     vocab_size = 3
     num_scalars = vocab_size # Output logits for all 3 tokens
@@ -308,7 +309,7 @@ def main():
             n_layers=args.n_layers,
             n_heads=args.n_heads,
             n_embed=args.n_embed,
-            max_position_embeddings=num_sites,
+            max_src_len=num_sites,
             physical_dim=3,
             grid_shape=tuple(args.size),
             fixed_positions=fixed_positions,
@@ -320,8 +321,8 @@ def main():
         # MLP not yet adapted for wrapper
         raise NotImplementedError("MLP not yet adapted for new training loop")
 
-    optimizer = optim.Adam(net.parameters(), lr=args.lr)
-    ema = EMA(net, beta=0.999) # utils_train uses EMA
+    ema = ExponentialMovingAverage(net.parameters(), decay=0.9999) # utils_train uses EMA
+    optimizer = optim.Adam(net.parameters(), lr=args.lr, weight_decay=0.00)
 
     # 4. Setup Bias Potential
     bias_potential = None
@@ -382,15 +383,30 @@ def main():
     #   This might need scaling in TransformerWrapper or just train with energy units.
     #   Usually fine if consistent.
     
-    # Let's define temps array (betas)
-    kB = ase.units.kB
+    # Set temps array for utils_train
+    # For single temp case, utils_train won't use args.temps (use_multi_temp_field=False)
+    # But we set it anyway for consistency. Note: get_temp_field_batch expects temps in Kelvin
+    # and computes beta = 1/T. So we pass temps in Kelvin, not scaled by kB.
     temps_k = np.linspace(args.temp_min, args.temp_max, args.num_temps)
-    scaled_temps = (kB * temps_k)
-    args.temps = scaled_temps
+    args.temps = temps_k  # Pass temperatures in Kelvin (not scaled by kB)
     args.fields = np.zeros(1) # Can extend for chemical potential
-    breakpoint()
 
     print("Starting training with utils_train.train...")
+    
+    # Create validation plotting callback
+    def validation_plot_callback(x, temps, fields, wandb_run=None, step=None):
+        """Callback function for plotting energy and Au concentration distributions during validation."""
+        plot_energy_au_conc_distributions(
+            x=x,
+            energy_model=energy_model,
+            temps=temps,
+            fields=fields,
+            save_path=os.path.join(args.out_dir, f"distributions_step_{step}.png") if step is not None else None,
+            wandb_run=wandb_run,
+            step=step,
+            title_suffix=" (MDNS)",
+        )
+    
     utils_train.train(
         model=net,
         optimizer=optimizer,
@@ -402,7 +418,8 @@ def main():
         wandb_run=wandb_run,
         bias_potential=bias_potential,
         save_dir=args.out_dir,
-        cfg_dict=vars(args)
+        cfg_dict=vars(args),
+        validation_plot_callback=validation_plot_callback,
     )
 
 if __name__ == "__main__":
