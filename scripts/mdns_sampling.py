@@ -2,9 +2,11 @@
 """
 Standalone script for running MDNS sampling and evaluation.
 Replicates functionality of mam_arm_sampling.py for MDNS models.
+Supports both Ising and CuAu models.
 """
 
 import argparse
+import json
 import logging
 import os
 import pickle as pkl
@@ -13,6 +15,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+import ase.build
+import ase.io
+import ase.units
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -21,10 +26,20 @@ from tqdm import tqdm
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from bias import BiasPotential
+from energy_cuau import K_B, AuCuAlloyModel
 from model import ExponentialMovingAverage, get_rope_vit_model
+from model.transformer import MultiOutputTransformer
+from train_cuau import CuAuRewardWrapper, TransformerWrapper
 from utils import ess
 from utils_ising import ising2d_ham, ising2d_mag
 from utils_train import _compute_log_stats, rnd
+
+# Try to import clease/icet for CuAu setup
+try:
+    from clease.settings import CEBulk, Concentration
+    from icet import ClusterExpansion
+except ImportError:
+    logging.warning("CLEASE/ICET not found. CuAu energy model initialization may fail.")
 
 # Configure logging
 logging.basicConfig(
@@ -37,25 +52,34 @@ logger = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run sampling for MDNS model over temperatures and fields."
+        description="Run sampling for MDNS model over temperatures and fields. Supports both Ising and CuAu models."
     )
     
-    # Model arguments
-    parser.add_argument("--L", type=int, default=16, help="Lattice size (Linear dimension)")
+    # Model type
+    parser.add_argument("--model-type", type=str, default="ising", choices=["ising", "cuau"],
+                       help="Model type: 'ising' or 'cuau'")
+    
+    # Model arguments (common)
+    parser.add_argument("--L", type=int, default=16, help="Lattice size (Linear dimension) for Ising")
+    parser.add_argument("--size", type=int, nargs=3, default=[2, 2, 4], help="Supercell size [nx, ny, nz] for CuAu")
     parser.add_argument("--embed-dim", type=int, default=64, help="Embedding dimension")
     parser.add_argument("--depth", type=int, default=4, help="Transformer depth")
     parser.add_argument("--num-heads", type=int, default=4, help="Number of attention heads")
     parser.add_argument("--vocab-size", type=int, default=3, help="Vocab size (default 3 for MDNS)")
+    
+    # CuAu-specific arguments
+    parser.add_argument("--eci-file", type=str, default=None, help="Path to ECI JSON file for CuAu")
+    parser.add_argument("--input-file", type=str, default=None, help="Path to input .vasp file for CuAu")
     
     # Bias Potential (WT-ASBS)
     parser.add_argument('--use_bias', action='store_true', help='Enable biased sampling (WT-ASBS)')
     parser.add_argument('--bias_sigma', type=float, default=0.05, help='Sigma for Gaussian bias kernel')
     parser.add_argument('--bias_height', type=float, default=0.1, help='Initial height (W) for bias kernel')
     parser.add_argument('--bias_factor', type=float, default=10.0, help='Bias factor (gamma) for Well-Tempered Metadynamics')
-    parser.add_argument('--bias_grid_size', type=int, default=100, help='Grid size for CV (Magnetization)')
+    parser.add_argument('--bias_grid_size', type=int, default=100, help='Grid size for CV')
     parser.add_argument('--kernel_type', type=str, default='gaussian', help='Kernel type: gaussian or delta')
-    parser.add_argument('--cv_min', type=float, default=-1.0, help='Minimum value for CV')
-    parser.add_argument('--cv_max', type=float, default=1.0, help='Maximum value for CV')
+    parser.add_argument('--cv_min', type=float, default=None, help='Minimum value for CV (default: -1.0 for Ising, 0.0 for CuAu)')
+    parser.add_argument('--cv_max', type=float, default=None, help='Maximum value for CV (default: 1.0 for Ising, 1.0 for CuAu)')
     
     # Checkpoint
     parser.add_argument(
@@ -71,14 +95,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         nargs="+",
         default=[2.269],
-        help="Temperatures to evaluate.",
+        help="Temperatures to evaluate (in Kelvin for CuAu).",
     )
     parser.add_argument(
         "--fields",
         type=float,
         nargs="+",
         default=[0.0],
-        help="External fields (chemical potentials) to evaluate.",
+        help="External fields (chemical potentials in eV) to evaluate.",
     )
     parser.add_argument(
         "--batch-size",
@@ -96,7 +120,7 @@ def parse_args() -> argparse.Namespace:
         "--J",
         type=float,
         default=1.0,
-        help="Interaction strength J.",
+        help="Interaction strength J (for Ising only).",
     )
     
     # Output
@@ -121,22 +145,58 @@ def parse_args() -> argparse.Namespace:
         help="Device to use.",
     )
     
-    return parser.parse_args()
+    args = parser.parse_args()
+    
+    # Set default CV ranges based on model type
+    if args.cv_min is None:
+        args.cv_min = 0.0 if args.model_type == "cuau" else -1.0
+    if args.cv_max is None:
+        args.cv_max = 1.0  # Same for both
+    
+    return args
+
+
+def setup_cuau_energy_model(args, device):
+    """Setup the CuAu Energy Model."""
+    if args.eci_file:
+        with open(args.eci_file, "r", encoding="utf-8") as f:
+            eci = json.load(f)
+    else:
+        logger.warning("No ECI file provided. Using dummy/default initialization if possible.")
+        eci = None
+
+    try:
+        conc = Concentration(basis_elements=[["Au", "Cu"]])
+        settings = CEBulk(
+            crystalstructure="fcc",
+            a=3.8,
+            size=args.size,
+            concentration=conc,
+            db_name="aucu_dft.db",
+            max_cluster_dia=[6.0, 4.5, 4.5],
+        )
+    except Exception as e:
+        logger.warning(f"Could not create CEBulk settings: {e}")
+        settings = None
+
+    atoms = None
+    if args.input_file:
+        if not os.path.exists(args.input_file):
+            raise FileNotFoundError(f"Input file not found: {args.input_file}")
+        logger.info(f"Loading structure from {args.input_file}")
+        atoms = ase.io.read(args.input_file)
+    else:
+        if settings is not None:
+            atoms = settings.atoms.copy()
+        else:
+            atoms = ase.build.bulk("Cu", "fcc", a=3.8).repeat(tuple(args.size))
+
+    model = AuCuAlloyModel(structure=atoms, settings=settings, eci=eci)
+    return model
 
 
 def load_model(args, device):
-    logger.info(f"Loading model from {args.ckpt}")
-    model = get_rope_vit_model(
-        L=args.L,
-        embed_dim=args.embed_dim,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        vocab_size=args.vocab_size,
-        device=device
-    )
-    
-    # Initialize EMA wrapper often used in MDNS
-    ema = ExponentialMovingAverage(model.parameters(), decay=0.9999)
+    logger.info(f"Loading {args.model_type} model from {args.ckpt}")
     
     checkpoint = torch.load(args.ckpt, map_location=device, weights_only=False)
     
@@ -144,21 +204,132 @@ def load_model(args, device):
     state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
     
     # Check if checkpoint has conditioning weights (for safe loading)
-    ckpt_has_weights = "beta_embedder.mlp.0.weight" in state_dict
+    # For CuAu models wrapped in TransformerWrapper, check for model.* keys
+    ckpt_has_weights = (
+        "beta_embedder.mlp.0.weight" in state_dict or
+        "model.thermo_embedder.mlp.0.weight" in state_dict or
+        any("thermo_embedder" in k for k in state_dict.keys())
+    )
     
-    if not ckpt_has_weights:
-        logger.warning("Checkpoint looks unconditional (missing beta_embedder). Loading with strict=False.")
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        # Verify only expected keys are missing
-        expected_missing = {"beta_embedder", "h_embedder", "thermo_proj"}
-        # Filter expected missing keys to reduce noise
-        real_missing = [k for k in missing if not any(e in k for e in expected_missing)]
-        if real_missing:
-            logger.info(f"Missing keys: {len(missing)}")
-            for k in real_missing:
-                logger.warning(f"Unexpected missing key: {k}")
+    if args.model_type == "cuau":
+        # Load CuAu model (MultiOutputTransformer wrapped in TransformerWrapper)
+        num_sites = args.size[0] * args.size[1] * args.size[2]
+        
+        # Setup energy model for CuAu first (needed to get fixed_positions)
+        energy_model = setup_cuau_energy_model(args, device)
+        
+        # Determine reference positions for RoPE from atoms
+        fixed_positions = None
+        if hasattr(energy_model, "atoms"):
+            ref_atoms = energy_model.atoms
+        else:
+            ref_atoms = getattr(energy_model, "atoms", None)
+        
+        # Check checkpoint to see if it was trained with fixed_positions or grid mode
+        # by checking for position_embedder buffers (they exist in grid mode, not in fixed_positions mode)
+        # Note: keys may have "model." prefix if saved from TransformerWrapper
+        checkpoint_has_position_buffers = any(
+            "position_embedder.default_input_pos" in k or "position_embedder.grid_dims" in k or
+            "model.position_embedder.default_input_pos" in k or "model.position_embedder.grid_dims" in k
+            for k in state_dict.keys()
+        )
+        
+        if checkpoint_has_position_buffers:
+            # Checkpoint has position buffers, so it was trained in grid mode
+            logger.info("Checkpoint has position_embedder buffers - model was trained in grid mode")
+            logger.info("Using grid_shape mode (fixed_positions=None) to match checkpoint")
+            fixed_positions = None  # Use grid mode to match checkpoint
+        elif ref_atoms is not None:
+            # Checkpoint doesn't have buffers, so it was trained with fixed_positions
+            # Extract scaled positions from atoms to match training configuration
+            fixed_positions = torch.tensor(
+                ref_atoms.get_scaled_positions(), dtype=torch.float32
+            )
+            logger.info(f"Checkpoint appears to be from fixed_positions mode")
+            logger.info(f"Extracted fixed_positions from atoms: shape {fixed_positions.shape}")
+        else:
+            logger.warning("No atoms found in energy_model - using grid mode as fallback")
+            fixed_positions = None
+        
+        vocab_size = 3
+        num_scalars = vocab_size
+        
+        base_net = MultiOutputTransformer(
+            num_scalars=num_scalars,
+            num_marginal=1,
+            n_layers=args.depth,
+            n_heads=args.num_heads,
+            n_embed=args.embed_dim,
+            max_src_len=num_sites,
+            physical_dim=3,
+            grid_shape=tuple(args.size),
+            fixed_positions=fixed_positions,
+            num_atom_types=vocab_size,
+        ).to(device)
+        
+        model = TransformerWrapper(base_net, vocab_size=vocab_size, length=num_sites, device=device)
     else:
-        model.load_state_dict(state_dict)
+        # Load Ising model (RopeVIT)
+        model = get_rope_vit_model(
+            L=args.L,
+            embed_dim=args.embed_dim,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            vocab_size=args.vocab_size,
+            device=device
+        )
+        energy_model = None
+    
+    # Initialize EMA wrapper often used in MDNS
+    ema = ExponentialMovingAverage(model.parameters(), decay=0.9999)
+    
+    # Load model weights
+    # For CuAu models, always use strict=False because position_embedder buffers may differ
+    # depending on whether fixed_positions was used during training
+    if args.model_type == "cuau" or not ckpt_has_weights:
+        logger.info("Loading state dict with strict=False (allowing buffer/parameter mismatches)")
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        
+        # Verify only expected keys are missing
+        expected_missing = {"beta_embedder", "h_embedder", "thermo_proj", "thermo_embedder"}
+        # For CuAu, position_embedder buffers may differ between fixed_positions and grid modes
+        if args.model_type == "cuau":
+            expected_missing.update({"default_input_pos", "grid_dims", "head_splits"})
+            # Filter out position_embedder buffer mismatches from missing keys
+            real_missing = [k for k in missing 
+                          if not any(e in k for e in expected_missing) 
+                          and "position_embedder" not in k]
+        else:
+            real_missing = [k for k in missing if not any(e in k for e in expected_missing)]
+        
+        if real_missing:
+            logger.warning(f"Missing keys: {len(real_missing)}")
+            for k in real_missing[:10]:  # Show first 10
+                logger.warning(f"  - {k}")
+        else:
+            logger.info("All critical parameters loaded successfully")
+        
+        # Log unexpected keys (buffers/params that exist in checkpoint but not in model)
+        if unexpected:
+            logger.info(f"Unexpected keys in checkpoint (not loaded into model): {len(unexpected)}")
+            # Filter out position_embedder buffer mismatches as these are expected
+            if args.model_type == "cuau":
+                real_unexpected = [k for k in unexpected 
+                                 if "position_embedder" not in k 
+                                 or ("default_input_pos" not in k and "grid_dims" not in k)]
+            else:
+                real_unexpected = unexpected
+            if real_unexpected:
+                for k in real_unexpected[:10]:  # Show first 10
+                    logger.info(f"  - {k}")
+    else:
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError as e:
+            logger.warning(f"Strict loading failed: {e}")
+            logger.info("Attempting non-strict loading...")
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            logger.info(f"Loaded with {len(missing)} missing keys and {len(unexpected)} unexpected keys")
 
     if 'ema_state_dict' in checkpoint:
         ema.load_state_dict(checkpoint['ema_state_dict'])
@@ -167,6 +338,7 @@ def load_model(args, device):
         logger.info("Loaded EMA weights into model")
     else:
         logger.warning("No EMA state dict found in checkpoint, using standard weights")
+    
     # Initialize BiasPotential if requested
     bias_pot = None
     if args.use_bias:
@@ -174,10 +346,33 @@ def load_model(args, device):
             logger.info("Loading BiasPotential from checkpoint")
             bias_state = checkpoint['bias_potential']
             
+            # For CuAu, convert temperature from Kelvin to energy units (eV) for initialization
+            # But checkpoint T should already be in eV (converted during training)
+            T_init = args.temps[0] if args.temps else 1.0
+            if args.model_type == "cuau":
+                T_init = K_B * T_init  # Convert Kelvin to eV for fallback initialization
+            
             # Check if params exist in state_dict (saved by modern bias.py)
             if 'params' in bias_state:
                 params = bias_state['params']
                 logger.info(f"Using bias params from checkpoint: {params}")
+                
+                # Get T from params
+                # For CuAu checkpoints, T is already in eV (converted during training in train_cuau.py line 375)
+                # For Ising checkpoints, T might be in different units - check if > 100 (likely Kelvin)
+                T_val = params.get('T', T_init)
+                if args.model_type == "cuau":
+                    # CuAu checkpoints always store T in eV - don't convert
+                    # Only convert if T_val > 100 (which would indicate it's in Kelvin, not eV)
+                    if isinstance(T_val, (int, float)) and T_val > 100.0:
+                        logger.warning(f"Bias potential T value {T_val} seems to be in Kelvin. Converting to eV.")
+                        T_val = K_B * T_val
+                    else:
+                        logger.info(f"Using bias T from checkpoint as-is: {T_val} eV")
+                elif isinstance(T_val, (int, float)) and T_val > 100.0:
+                    # For Ising, if T > 100, likely in Kelvin (though Ising typically uses dimensionless beta)
+                    logger.warning(f"Bias potential T value {T_val} seems to be in Kelvin. Converting.")
+                    T_val = K_B * T_val
                 
                 bias_pot = BiasPotential(
                     cv_min=params.get('cv_min', args.cv_min), 
@@ -186,14 +381,13 @@ def load_model(args, device):
                     sigma=params.get('sigma', args.bias_sigma),
                     initial_height=params.get('initial_height', args.bias_height),
                     bias_factor=params.get('bias_factor', args.bias_factor),
-                    T=params.get('T', args.temps[0] if args.temps else 1.0),
+                    T=T_val,
                     kernel_type=params.get('kernel_type', args.kernel_type),
                     device=device
                 )
             else:
                 # Fallback to CLI args if params not inside state_dict
                 logger.warning("Bias params not found in checkpoint state dict! Using CLI arguments.")
-                T_init = args.temps[0] if args.temps else 1.0 
                 bias_pot = BiasPotential(
                     cv_min=args.cv_min, cv_max=args.cv_max, 
                     grid_size=args.bias_grid_size,
@@ -207,13 +401,29 @@ def load_model(args, device):
             
             bias_pot.load_state_dict(bias_state)
             
+            # Validate that all sampling temperatures match training temperature for metadynamics
+            if args.use_bias and args.model_type == "cuau" and args.temps:
+                # bias_pot.T is in eV (energy units) - this is the training temperature
+                training_T_ev = bias_pot.T  # Already in eV
+                training_T_k = training_T_ev / K_B  # Convert back to Kelvin for comparison
+                
+                # Check all sampling temperatures match
+                for sampling_temp_k in args.temps:
+                    tolerance_k = 0.1  # Allow 0.1K difference
+                    if abs(sampling_temp_k - training_T_k) > tolerance_k:
+                        raise ValueError(
+                            f"Sampling temperature ({sampling_temp_k}K) does not match "
+                            f"bias potential training temperature ({training_T_k:.2f}K = {training_T_ev:.6f} eV). "
+                            f"For metadynamics, all sampling temperatures must match the training temperature."
+                        )
+                logger.info(f"✓ All sampling temperatures match training temperature ({training_T_k:.2f}K = {training_T_ev:.6f} eV)")
+            
             # Normalize bias potential (shift min to 0) to avoid numerical explosion in weights
             logger.info("Normalizing bias potential (shifting min to 0)...")
             bias_pot.normalize()
             
         else:
             logger.warning("Bias potential requested but not found in checkpoint! Using initialized (empty/initial) bias from CLI args.")
-            T_init = args.temps[0] if args.temps else 1.0 
             bias_pot = BiasPotential(
                 cv_min=args.cv_min, cv_max=args.cv_max, 
                 grid_size=args.bias_grid_size,
@@ -234,7 +444,7 @@ def load_model(args, device):
     if force_conditioning and not ckpt_has_weights:
         logger.warning("Requesting a sweep (conditioning needed) but checkpoint lacks conditioning weights. Proceeding with random embeddings (IS with unconditioned proposal).")
         
-    return model, force_conditioning, bias_pot
+    return model, force_conditioning, bias_pot, energy_model
 
 
 def _format_key(temp: float, field: float) -> str:
@@ -246,11 +456,10 @@ def run_sampling(
     args: argparse.Namespace,
     device: torch.device,
     has_conditioning: bool,
-    bias_pot: Optional[BiasPotential] = None
+    bias_pot: Optional[BiasPotential] = None,
+    energy_model: Optional[Any] = None
 ) -> Dict[str, Dict[str, Any]]:
     
-    configs = defaultdict(list)
-    energies = defaultdict(list)
     configs = defaultdict(list)
     energies = defaultdict(list)
     x_up = defaultdict(list)
@@ -264,44 +473,101 @@ def run_sampling(
     free_energy_profiles: Dict[str, np.ndarray] = {}
     cv_grids: Dict[str, np.ndarray] = {}
     
-    # Define reward function factory to match train_ising.py logic
-    def get_reward_fn(default_beta, default_h, J=1, bias_pot=None):
-        def reward_fn(x, beta=None, h=None, J=J, **kwargs):
-            """Reward function wrapper that handles scalar or per-sample betas/fields."""
-            beta_val = beta if beta is not None else default_beta
-            h_val = h if h is not None else default_h
+    # Define CV computation functions based on model type
+    def compute_cv_ising(x):
+        """Compute magnetization CV for Ising model."""
+        spins = 2 * x.float() - 1
+        return ising2d_mag(spins)
+    
+    def compute_cv_cuau(x, energy_model_arg=None):
+        """Compute Au concentration CV for CuAu alloy.
+        
+        Args:
+            x: Input configurations [B, L]
+            energy_model_arg: Energy model instance (optional, for CuAuRewardWrapper compatibility)
+        """
+        # If energy_model_arg is provided (from CuAuRewardWrapper), use it
+        # Otherwise use the energy_model from closure
+        if energy_model_arg is not None:
+            return energy_model_arg.get_concentrations(x)
+        else:
+            if energy_model is None:
+                raise ValueError("Energy model required for CuAu sampling")
+            return energy_model.get_concentrations(x)
+    
+    # Select CV computation function based on model type
+    if args.model_type == "cuau":
+        if energy_model is None:
+            raise ValueError("Energy model required for CuAu sampling")
+        cv_compute_fn = compute_cv_cuau
+        
+        def get_reward_fn(default_temp_k, default_field, bias_pot=None):
+            # Create CuAuRewardWrapper
+            # CuAuRewardWrapper handles bias internally if bias_potential and cv_compute_fn are provided
+            reward_wrapper = CuAuRewardWrapper(
+                energy_model, 
+                vocab_map={0: 29, 1: 79}, 
+                default_temp_k=default_temp_k
+            )
             
-            spin = 2 * x.float() - 1
-            return -beta_val * ising2d_ham(spin, J=J, h=h_val)
+            def reward_fn(x, beta=None, h=None, J=1, **kwargs):
+                # For CuAu, beta is inverse temperature: beta = 1/(kB*T)
+                # CuAuRewardWrapper handles the conversion internally
+                return reward_wrapper(x, beta=beta, h=h, J=J, use_bias=args.use_bias,
+                                     bias_potential=bias_pot, cv_compute_fn=cv_compute_fn)
+            
+            return reward_fn
+            
+    else:
+        # Ising reward function
+        cv_compute_fn = compute_cv_ising
+        
+        def get_reward_fn(default_beta, default_h, J=1, bias_pot=None):
+            def reward_fn(x, beta=None, h=None, J=J, **kwargs):
+                """Reward function wrapper that handles scalar or per-sample betas/fields."""
+                beta_val = beta if beta is not None else default_beta
+                h_val = h if h is not None else default_h
+                
+                spin = 2 * x.float() - 1
+                return -beta_val * ising2d_ham(spin, J=J, h=h_val)
 
-        def biased_reward_fn(x, beta=None, h=None, J=J, use_bias=True):
-            # 1. Standard reward
-            r = reward_fn(x, beta=beta, h=h, J=J)
+            def biased_reward_fn(x, beta=None, h=None, J=J, use_bias=True):
+                # 1. Standard reward
+                r = reward_fn(x, beta=beta, h=h, J=J)
+                
+                # 2. Add Bias: R' = R - beta * V(s)
+                if bias_pot is not None and use_bias:
+                    # Convert x (0,1) to spins (-1,1) for CV calc
+                    s = compute_cv_ising(x)
+                    v = bias_pot.evaluate(s)
+                    
+                    # Get beta for scaling
+                    beta_val = beta if beta is not None else default_beta
+                    # Handle tensor/scalar beta
+                    if isinstance(beta_val, (int, float)):
+                        beta_tensor = torch.tensor(beta_val, device=x.device)
+                    elif isinstance(beta_val, torch.Tensor):
+                        beta_tensor = beta_val.to(x.device)
+                    else:
+                        beta_tensor = torch.tensor(beta_val, device=x.device) # Fallback
+                    
+                    r = r - beta_tensor * v
+                return r
             
-            # 2. Add Bias: R' = R - beta * V(s)
-            if bias_pot is not None:
-                 # Convert x (0,1) to spins (-1,1) for CV calc
-                 s = ising2d_mag(2*x - 1)
-                 v = bias_pot.evaluate(s)
-                 
-                 # Get beta for scaling
-                 beta_val = beta if beta is not None else default_beta
-                 # Handle tensor/scalar beta
-                 if isinstance(beta_val, (int, float)):
-                     beta_tensor = torch.tensor(beta_val, device=x.device)
-                 elif isinstance(beta_val, torch.Tensor):
-                     beta_tensor = beta_val.to(x.device)
-                 else:
-                     beta_tensor = torch.tensor(beta_val, device=x.device) # Fallback
-                 
-                 r = r - beta_tensor * v if use_bias else r
-            return r
-            
-        return biased_reward_fn if args.use_bias else reward_fn
+            return biased_reward_fn if args.use_bias else reward_fn
 
     # Loop over conditions
     for temp in tqdm(args.temps, desc="Temps"):
-        beta = 1.0 / temp
+        # Convert temperature to beta based on model type
+        if args.model_type == "cuau":
+            # For CuAu, temp is in Kelvin, beta = 1/(kB*T) in 1/eV
+            beta = 1.0 / (K_B * temp)
+            temp_k = temp  # Store in Kelvin for CuAu
+        else:
+            # For Ising, temp is dimensionless (equivalent to 1/beta)
+            beta = 1.0 / temp
+            temp_k = None  # Not used for Ising
+        
         for field in tqdm(args.fields, desc="Fields", leave=False):
             key = _format_key(temp, field)
             
@@ -318,43 +584,46 @@ def run_sampling(
             
             pbar = tqdm(total=args.num_samples, desc=f"Sampling {key}", leave=False)
             
-            # Create condition-specific reward function (closure over beta/field)
-            # This matches train_ising logic: default_beta/h are bound to the current condition
-            current_reward_fn = get_reward_fn(default_beta=beta, default_h=field, J=args.J, bias_pot=bias_pot)
+            # Create condition-specific reward function (closure over beta/field or temp/field)
+            if args.model_type == "cuau":
+                current_reward_fn = get_reward_fn(default_temp_k=temp_k, default_field=field, bias_pot=bias_pot)
+            else:
+                current_reward_fn = get_reward_fn(default_beta=beta, default_h=field, J=args.J, bias_pot=bias_pot)
             
             while samples_collected < args.num_samples:
                 current_batch_size = min(args.batch_size, args.num_samples - samples_collected)
                 with torch.no_grad():
                     # Handle conditional vs unconditional
                     if has_conditioning:
-                        # Pass beta/h to rnd explicitly (overriding defaults if needed, but defaults match)
-                        
-                        # Note: rnd implementation passes beta_batch/h_batch to reward_model
-                        # Our current_reward_fn handles beta=... arguments.
-                        # It also defaults use_bias=True in biased_reward_fn.
+                        # For CuAu, pass temp in Kelvin; for Ising, pass beta
+                        if args.model_type == "cuau":
+                            temp_batch = torch.full((current_batch_size,), temp_k, device=device).float()
+                            field_batch = torch.full((current_batch_size,), field, device=device).float()
+                            # For rnd, we need to pass beta_batch and h_batch
+                            # CuAuRewardWrapper will handle the conversion
+                            beta_batch = 1.0 / (K_B * temp_batch)
+                            h_batch = field_batch
+                        else:
+                            beta_batch = torch.full((current_batch_size,), beta, device=device).float()
+                            h_batch = torch.full((current_batch_size,), field, device=device).float()
                         
                         x, log_rnd = rnd(
                             model, 
                             current_reward_fn, 
                             batch_size=current_batch_size, 
                             device=device,
-                            beta_batch=torch.full((current_batch_size,), beta, device=device).float(),
-                            h_batch=torch.full((current_batch_size,), field, device=device).float(),
+                            beta_batch=beta_batch,
+                            h_batch=h_batch,
                             J=args.J
                         )
                         # Compute stats
-                        # We need unbiased stats for logf_t.
-                        # biased_reward_fn has use_bias=True default.
-                        # To get unbiased, we must pass use_bias=False.
-                        # _compute_log_stats internally calls reward_fn(..., use_bias=False)
-                        # So we just pass the biased function, and it handles it!
-                        
                         logf_t, logp_x = _compute_log_stats(
                             x, log_rnd, current_reward_fn, model,
-                            beta_batch=torch.full((current_batch_size,), beta, device=device).float(),
-                            h_batch=torch.full((current_batch_size,), field, device=device).float(),
+                            beta_batch=beta_batch,
+                            h_batch=h_batch,
                             J=args.J,
-                            bias_potential=bias_pot
+                            bias_potential=bias_pot,
+                            cv_compute_fn=cv_compute_fn if args.model_type == "cuau" else None
                         )
                     else:
                         # Unconditional model
@@ -367,69 +636,73 @@ def run_sampling(
                             h_batch=None,
                             J=args.J
                         )
-                         # Compute stats
+                        # Compute stats
                         logf_t, logp_x = _compute_log_stats(
                             x, log_rnd, current_reward_fn, model,
                             beta_batch=None,
                             h_batch=None,
                             J=args.J,
-                            bias_potential=bias_pot
+                            bias_potential=bias_pot,
+                            cv_compute_fn=cv_compute_fn if args.model_type == "cuau" else None
                         )
                     
                     log_rw = logf_t - logp_x
 
-
-                    # Compute energies (unweighted, raw energy H(s))
-                    # H(s) = -J * sum(s_i s_j) - h * sum(s_i)
-                    # ising2d_ham yields -beta * H(s). So H(s) = ising2d_ham / (-beta) ??
-                    # Wait, ising2d_ham returns ENERGY if beta=1?
-                    # ising2d_ham implementation: returns - \sum <neighbors> - h \sum s_i
-                    # Wait, ising_model_eval says: reward = ... -beta * ising2d_ham(..., J=J, h=h)
-                    # Usually Hamiltonian H is what we want. 
-                    # Let's check ising2d_ham in utils_ising.py later if needed.
-                    # Assuming ising2d_ham returns the Hamiltonian H(x).
-                    # Actually, usually `ising2d_ham` computes the energy H.
-                    # And probability is exp(-beta * H).
-                    # So log_prob is -beta * H.
-                    # In eval notebook: reward = -beta * ising2d_ham(...)
-                    # This implies ising2d_ham returns H.
-                    
-                    spins = 2 * x.float() - 1
-                    raw_energy = ising2d_ham(spins, J=args.J, h=field)
-                    
-                    # Magnetization (x_up)
-                    # x is 0,1. x_up is fraction of 1s? Or magnetization per site?
-                    # mam_arm_sampling says: x_spin_up = numbers.float().mean(dim=1)
-                    # For Ising (0,1), this is density of 1s.
-                    mag = x.float().mean(dim=1)
-                    
-                    
-                    # Calculate log_rw (log reweighting factor)
-                    # log_rw = logf_t - logp_x
-                    log_rw = logf_t - logp_x
+                    # Compute energies (unweighted, raw energy)
+                    if args.model_type == "cuau":
+                        # For CuAu, use energy_model.get_energy
+                        if energy_model is None:
+                            raise ValueError("Energy model required for CuAu sampling")
+                        raw_energy = energy_model.get_energy(x)  # [B] in eV
+                        # Au concentration (x_up)
+                        cv_val = energy_model.get_concentrations(x)  # [B]
+                    else:
+                        # For Ising, use ising2d_ham
+                        spins = 2 * x.float() - 1
+                        raw_energy = ising2d_ham(spins, J=args.J, h=field)
+                        # Magnetization (x_up) - using CV computation function
+                        cv_val = compute_cv_ising(x)
                     
                     # Store batch
                     batch_configs.append(x.cpu().numpy())
                     batch_energies.append(raw_energy.cpu().numpy())
-                    batch_x_up.append(mag.cpu().numpy())
+                    batch_x_up.append(cv_val.cpu().numpy())
                     batch_log_rnd.append(log_rnd.cpu().numpy()) # Store log_rnd
                     batch_log_rw.append(log_rw.cpu().numpy()) # Store log_rw
                     batch_logp_x.append(logp_x.cpu().numpy())
                     batch_logf_t.append(logf_t.cpu().numpy())
                     
                     if bias_pot is not None:
-                         # Calculate weights = exp(beta_bias * v(s))
-                         # s comes from ising2d_mag(2*x-1)
-                         spins = 2 * x.float() - 1
-                         mag = ising2d_mag(spins) # [B]
-                         v_s = bias_pot.evaluate(mag) # [B]
-                         beta_bias = 1.0 / bias_pot.T
-                         
-                         # Log-weights: log_w = beta_bias * v_s
-                         log_w = beta_bias * v_s
-                                                  
-                         w = torch.exp(log_w).detach().cpu().numpy()
-                         batch_weights.append(w)
+                        # Calculate unbiasing weights = exp(beta_current * V(s))
+                        # where beta_current is for the CURRENT sampling temperature (not training temperature!)
+                        # s is the CV value (magnetization for Ising, Au concentration for CuAu)
+                        v_s = bias_pot.evaluate(cv_val)  # [B] in eV (bias potential values)
+                        
+                        # Use bias_pot.T for unbiasing (validated to match sampling temperature above)
+                        # Since sampling temp matches training temp, we can use the stored T
+                        beta_bias = 1.0 / bias_pot.T  # in 1/eV for CuAu, or dimensionless for Ising
+                        
+                        # Log-weights: log_w = beta_bias * V(s)
+                        # This removes the bias: p_unbiased(x) = p_biased(x) * exp(beta * V(s))
+                        log_w = beta_bias * v_s
+                        
+                        # Clamp log_w to prevent numerical overflow
+                        # exp(700) is near float32 max, so clamp to reasonable range
+                        log_w_max = 50.0  # exp(50) ≈ 5e21, still manageable
+                        log_w_clamped = torch.clamp(log_w, max=log_w_max)
+                        
+                        # Log warning if values were clamped (indicates potential issue)
+                        if (log_w > log_w_max).any():
+                            num_clamped = (log_w > log_w_max).sum().item()
+                            if samples_collected == 0:  # Only log once per condition
+                                max_v = v_s.max().item()
+                                max_logw = log_w.max().item()
+                                logger.warning(f"Clamped {num_clamped} unbiasing weights (log_w > {log_w_max}). "
+                                             f"Max V(s)={max_v:.2f} eV, max log_w={max_logw:.2f}, "
+                                             f"beta_bias={beta_bias:.4f}")
+                        
+                        w = torch.exp(log_w_clamped).detach().cpu().numpy()
+                        batch_weights.append(w)
                     
                     samples_collected += current_batch_size
                     pbar.update(current_batch_size)
@@ -457,7 +730,13 @@ def run_sampling(
             # log Z = logsumexp(log_rw) - log(N)
             log_rw_tensor = torch.tensor(log_rw_values[key], device=device)
             log_Z = torch.logsumexp(log_rw_tensor, dim=0) - np.log(len(log_rw_tensor))
-            f_val = -(1.0/beta) * log_Z
+            
+            # For CuAu, use temperature in Kelvin; for Ising, use beta
+            if args.model_type == "cuau":
+                f_val = -(K_B * temp_k) * log_Z  # F = -kB*T*log(Z) in eV
+            else:
+                f_val = -(1.0/beta) * log_Z  # F = -(1/beta)*log(Z)
+            
             free_energies[key] = f_val.item()
             
             logger.info(f"[{key}] NESS: {ness_values[key]:.4f}, Free Energy: {free_energies[key]:.4f}")
@@ -481,7 +760,12 @@ def run_sampling(
                 # Physical Free Energy using log_rw (consistent with Free Energy choice)
                 log_rw_total_tensor = torch.tensor(log_rw_values[key], device=device) + torch.tensor(log_w_np, device=device)
                 log_Z_phys = torch.logsumexp(log_rw_total_tensor, dim=0) - np.log(len(log_rw_total_tensor))
-                f_phys = -(1.0/beta) * log_Z_phys
+                
+                # For CuAu, use temperature in Kelvin for free energy calculation
+                if args.model_type == "cuau":
+                    f_phys = -(K_B * temp_k) * log_Z_phys  # F = -kB*T*log(Z)
+                else:
+                    f_phys = -(1.0/beta) * log_Z_phys  # F = -(1/beta)*log(Z)
                 
                 logger.info(f"[{key}] Physical NESS (Corrected): {ness_phys:.4f}, Physical Free Energy: {f_phys.item():.4f}")
                 
@@ -491,16 +775,22 @@ def run_sampling(
                 ness_values[f"{key}_physical"] = float(ness_phys)
                 free_energies[f"{key}_physical"] = f_phys.item()
 
-
                 # Calculate Free Energy Profile from Bias Potential if available
                 grid_vals, bias_vals = bias_pot.get_bias_grid_np()
                 gamma = bias_pot.gamma
                 
                 # F(s) ~ - (gamma / (gamma - 1)) * V(s)
+                # For CuAu, convert from energy units (eV) to physical units
                 if gamma > 1.0:
                     free_energy_profile = - (gamma / (gamma - 1)) * bias_vals
                 else:
                     free_energy_profile = - bias_vals 
+                
+                # For CuAu, convert from eV to kB*T units if needed for consistency
+                if args.model_type == "cuau":
+                    # bias_vals is in eV (from BiasPotential with T in eV)
+                    # Convert to kB*T units for display
+                    free_energy_profile = free_energy_profile / (K_B * temp_k)
                     
                 # Shift so that the ends are zero (as requested)
                 # Average of ends to be robust
@@ -546,13 +836,13 @@ def main():
     logger.info(f"Using device: {device}")
     
     # Load model
-    model, has_conditioning, bias_pot = load_model(args, device)
+    model, has_conditioning, bias_pot, energy_model = load_model(args, device)
     
     # Run sampling
     
     # Check for conditioning logic requested by user
     # Logic now handled inside load_model and returned as has_conditioning (force_conditioning)
-    results = run_sampling(model, args, device, has_conditioning, bias_pot)
+    results = run_sampling(model, args, device, has_conditioning, bias_pot, energy_model)
     
     # Save results
     save_results(args, results)
