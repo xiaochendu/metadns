@@ -128,7 +128,7 @@ def cycleloader(dataloader):
             yield data
 
 
-def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None, num_sites=None):
+def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None, num_sites=None, s_buffer=None):
     """
     Plots bias analysis:
     1. Estimated Free Energy F(s) (from Bias Potential)
@@ -139,6 +139,7 @@ def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None, 
     s_batch: Tensor/Array of CV values from current batch
     log_rnd: Tensor/Array of log-RND values (log R_biased - log P_model)
     num_sites: Optional number of sites/atoms/spins for per-site free energy calculation
+    s_buffer: Optional Tensor/Array of CV values from replay buffer
     """
     try:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -185,6 +186,7 @@ def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None, 
 
         # 2. Raw Distribution (Histogram of s)
         # Should be effectively flat if converged
+        has_raw_dist = False
         if s_batch is not None:
             if isinstance(s_batch, torch.Tensor):
                 s_np = s_batch.detach().cpu().numpy()
@@ -193,11 +195,25 @@ def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None, 
                 
             # Histogram
             axes[1].hist(s_np, bins=bias_potential.grid_size, range=(bias_potential.cv_min, bias_potential.cv_max), density=True, alpha=0.6, color='green', label='Sampled')
-            axes[1].set_title('Raw Distribution P(s) (Should be Flat)')
+            has_raw_dist = True
+            
+        if s_buffer is not None:
+            if isinstance(s_buffer, torch.Tensor):
+                s_buf_np = s_buffer.detach().cpu().numpy()
+            else:
+                s_buf_np = s_buffer
+            
+            axes[1].hist(s_buf_np, bins=bias_potential.grid_size, range=(bias_potential.cv_min, bias_potential.cv_max), density=True, alpha=0.6, color='orange', label='Buffer')
+            has_raw_dist = True
+
+        if has_raw_dist:
+            axes[1].set_title('Raw Distribution P(s)')
             axes[1].set_xlabel('CV')
             axes[1].set_ylabel('Density')
             axes[1].grid(True)
+            axes[1].legend()
             
+        if s_batch is not None:
             # 3. Corrected Distribution (Reweighted)
             # P_unbiased(s) ~ P_biased(s) * exp(beta * V(s))
             # weight = exp( bias_potential.evaluate(s) / T )

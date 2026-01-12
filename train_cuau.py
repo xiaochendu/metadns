@@ -242,6 +242,9 @@ def get_args():
     parser.add_argument("--no_normalize_bias_by_batch", dest="normalize_bias_by_batch", action="store_false", default=True,
                         help="Disable normalization of bias_height by batch_size (default: normalization enabled). Recommended for diffusion samplers that deposit bias more frequently than traditional MCMC.")
     
+    # Replay Buffer
+    parser.add_argument("--buffer_size", type=int, default=0, help="Size of experience replay buffer")
+    parser.add_argument("--buffer_ratio", type=float, default=0.0, help="Ratio of buffer samples in training batch")
     
     # Logging
     parser.add_argument("--out_dir", type=str, default="results/cuau")
@@ -499,6 +502,8 @@ def main():
         cfg_dict=vars(args),
         validation_plot_callback=validation_plot_callback,
         cv_compute_fn=compute_cv_cuau,
+        buffer_size=args.buffer_size,
+        buffer_ratio=args.buffer_ratio,
     )
 
 if __name__ == "__main__":

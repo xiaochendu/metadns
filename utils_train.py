@@ -8,7 +8,6 @@ import torch.distributed as dist
 import wandb
 from matplotlib.colors import ListedColormap
 from tqdm import tqdm
-
 from utils import ess, plot_bias_analysis, sample_categorical_logits
 from utils_ising import ising2d_mag
 
@@ -18,6 +17,149 @@ try:
     K_B = ase.units.kB  # eV/K
 except ImportError:
     K_B = 8.617333262e-5  # eV/K (fallback)
+
+
+
+class ReplayBuffer:
+    """Experience Replay Buffer for MDNS.
+    
+    Stores samples (x, beta, h) and allows sampling mixed batches.
+    Designed to be stored on CPU to save VRAM, with on-demand move to GPU.
+    """
+    def __init__(self, buffer_size, x_shape, device='cpu', dtype=torch.float32):
+        self.buffer_size = buffer_size
+        self.device = device  # Device where samples are returned (usually GPU)
+        self.storage_device = 'cpu' # Store on CPU to save VRAM
+        self.ptr = 0
+        self.size = 0
+        
+        # Pre-allocate tensors on CPU
+        # x_shape is (D,)
+        self.x = torch.zeros((buffer_size, *x_shape), dtype=torch.long, device=self.storage_device)
+        self.beta = torch.zeros(buffer_size, dtype=dtype, device=self.storage_device)
+        self.h = torch.zeros(buffer_size, dtype=dtype, device=self.storage_device)
+        self.has_conditions = False # Track if we are actually storing conditions
+
+    def add(self, x, beta=None, h=None):
+        """Add a batch of samples to the buffer."""
+        # Clean inputs and move to storage device
+        x = x.to(self.storage_device)
+        batch_size = x.shape[0]
+        
+        if batch_size > self.buffer_size:
+            # If batch to add is larger than buffer, take last part
+            x = x[-self.buffer_size:]
+            if beta is not None: beta = beta[-self.buffer_size:]
+            if h is not None: h = h[-self.buffer_size:]
+            batch_size = x.shape[0]
+            
+        # Indices for circular buffer
+        indices = torch.arange(self.ptr, self.ptr + batch_size) % self.buffer_size
+        
+        self.x[indices] = x
+        
+        if beta is not None:
+            self.has_conditions = True
+            if isinstance(beta, torch.Tensor):
+                beta_in = beta.to(self.storage_device)
+                if beta_in.ndim == 0:
+                    beta_in = beta_in.expand(batch_size)
+                self.beta[indices] = beta_in
+            else:
+                self.beta[indices] = torch.full((batch_size,), beta, device=self.storage_device)
+                
+        if h is not None:
+            self.has_conditions = True
+            if isinstance(h, torch.Tensor):
+                h_in = h.to(self.storage_device)
+                if h_in.ndim == 0:
+                    h_in = h_in.expand(batch_size)
+                self.h[indices] = h_in
+            else:
+                self.h[indices] = torch.full((batch_size,), h, device=self.storage_device)
+        
+        self.ptr = (self.ptr + batch_size) % self.buffer_size
+        self.size = min(self.size + batch_size, self.buffer_size)
+
+    def sample(self, batch_size):
+        """Sample a batch from the buffer."""
+        if self.size == 0:
+            return None, None, None
+            
+        indices = torch.randint(0, self.size, (batch_size,))
+        
+        x_out = self.x[indices].to(self.device)
+        
+        if self.has_conditions:
+            beta_out = self.beta[indices].to(self.device)
+            h_out = self.h[indices].to(self.device)
+        else:
+            beta_out = None
+            h_out = None
+            
+        return x_out, beta_out, h_out
+
+
+def compute_model_log_prob(model, x, beta=None, h=None):
+    """Compute the model component of log_rnd for samples x.
+    
+    This function iteratively computes the accumulation term:
+       sum_{t} [ -log(V-1) - log P(x_t | x_{<t}) ]
+    which matches the calculation in the rnd() sampling function.
+    
+    Args:
+        model: Autoregressive model
+        x: [B, D] input samples (fully observed)
+        beta: [B] or scalar
+        h: [B] or scalar
+        
+    Returns:
+        log_rnd_model_term: [B] The accumulated model term of log_rnd.
+           To get full log_rnd, add reward_fn(x): 
+           log_rnd = log_rnd_model_term + reward_fn(x)
+    """
+    if hasattr(model, 'module'):
+        model = model.module
+        
+    batch_size = x.shape[0]
+    device = x.device
+    
+    # Initialize mock 'x' with masks to simulate generation
+    # We use the actual token values from input x but revealed iteratively
+    x_curr = torch.full((batch_size, model.length), model.vocab_size-1, device=device, dtype=torch.int64)
+    
+    # Random order for each sample (same as rnd)
+    jump_pos = torch.rand(x.shape, device=device).argsort(dim=-1)
+    
+    batch_arange = torch.arange(batch_size, device=device)
+    log_rnd_term = torch.zeros(batch_size, device=device)
+    
+    for d in range(model.length-1, -1, -1):
+        # Forward pass on current partially masked sequence
+        if beta is not None or h is not None:
+            logits = model(x_curr, beta=beta, h=h)[:, :, :-1]
+        else:
+            logits = model(x_curr)[:, :, :-1]
+            
+        # Check if raw logits or log probs
+        if (logits > 0).any(): 
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+        else:
+            log_probs = logits
+
+        # Identify which token is being "revealed" at this step
+        # In rnd(), 'update' is sampled. Here, 'update' is the true token from x.
+        update_pos = jump_pos[:, d] # [B]
+        update_val = x[batch_arange, update_pos] # [B]
+        
+        # Accumulate: -log(V-1) - log P(x_t | ...)
+        # Note: model.vocab_size usually includes mask, so vocab_size-1 is number of real tokens.
+        log_rnd_term += -np.log(model.vocab_size-1) - log_probs[batch_arange, update_pos, update_val]
+        
+        # Reveal the token in x_curr for next step
+        x_curr[batch_arange, update_pos] = update_val
+        
+    return log_rnd_term
 
 
 def save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg, path, bias_potential=None):
@@ -453,7 +595,8 @@ def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16,
 def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=None,
           losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None, 
           bias_potential=None, current_fields=None, rng=None, save_dir=None, cfg_dict=None,
-          validation_plot_callback=None, cv_compute_fn=None):
+          validation_plot_callback=None, cv_compute_fn=None,
+          buffer_size=0, buffer_ratio=0.0):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
                'wdce': loss_wdce}.get(args.loss_fn)
     if loss_fn is None:
@@ -466,6 +609,14 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
     pbar = tqdm(range(num_epochs))
     if args.seed is not None:
         torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
+
+    # Initialize Replay Buffer
+    replay_buffer = None
+    if buffer_size > 0:
+        # Determine dimension D from model
+        D = model.length
+        replay_buffer = ReplayBuffer(buffer_size, (D,), device=device)
+        print(f"Initialized ReplayBuffer with size {buffer_size} and mixing ratio {buffer_ratio}")
 
     # Handle multiple temperatures/fields
     from utils_ising import get_temp_field_batch, sample_temp_field
@@ -590,15 +741,79 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                     s = ising2d_mag(x_spins)
                 bias_potential.update(s)
 
+        # Add to Replay Buffer - ONLY FRESH SAMPLES
+        if replay_buffer is not None and is_fresh_sample:
+            replay_buffer.add(x, beta=beta_batch, h=h_batch)
+            
+        # Prepare Training Batch (Mix Fresh + Replay)
+        x_train, log_rnd_train = x, log_rnd
+        beta_train, h_train = beta_batch, h_batch
+        
+        # Only mix if we have fresh samples (user requirement for WDCE)
+        if is_fresh_sample and replay_buffer is not None and replay_buffer.size >= args.batch_size:
+            n_replay = int(args.batch_size * buffer_ratio)
+            if n_replay > 0 and n_replay < args.batch_size:
+                # Slice fresh samples
+                n_fresh = args.batch_size - n_replay
+                x_f = x[:n_fresh]
+                log_rnd_f = log_rnd[:n_fresh]
+                beta_f = beta_batch[:n_fresh] if beta_batch is not None else None
+                h_f = h_batch[:n_fresh] if h_batch is not None else None
+                
+                # Sample from Buffer
+                x_r, beta_r, h_r = replay_buffer.sample(n_replay)
+                
+                # RECALCULATE log_rnd for Replay Samples
+                # log_rnd = log_reward(current_bias) + log_model_term
+                # Note: compute_model_log_prob returns sum[ -log(V-1) - log P(x_t) ]
+                # So we simply add it to log_reward.
+                with torch.no_grad():
+                    # Recalculate Reward with CURRENT bias
+                    J_val = args.J if hasattr(args, 'J') else 1
+                    log_reward_r = reward_fn(x_r, beta=beta_r, h=h_r, J=J_val, use_bias=True)
+                    
+                    # Recalculate Model Term with CURRENT model
+                    log_model_term_r = compute_model_log_prob(model, x_r, beta=beta_r, h=h_r)
+                    
+                    log_rnd_r = log_reward_r + log_model_term_r
+                
+                # Combine
+                x_train = torch.cat([x_f, x_r], dim=0)
+                log_rnd_train = torch.cat([log_rnd_f, log_rnd_r], dim=0)
+                
+                if beta_batch is not None:
+                    # If beta_r came back as None (shouldn't if buffer works right), handle it
+                    if beta_r is None: # Fallback
+                         if beta_batch is not None:
+                             beta_r = beta_batch[:n_replay] 
+                    beta_train = torch.cat([beta_f, beta_r], dim=0)
+                elif beta_r is not None:
+                     # Fresh was None but Replay has Beta? (Unlikely in consistent run)
+                     pass
+
+                if h_batch is not None:
+                    if h_r is None: 
+                        if h_batch is not None:
+                            h_r = h_batch[:n_replay]
+                    h_train = torch.cat([h_f, h_r], dim=0)
+
+        # Recalculate loss on mixed batch (overwriting previous loss calculation)
+        if args.loss_fn == 'wdce':
+            loss = loss_wdce(model, log_rnd_train, x_train,
+                                num_replicates=args.wdce_num_replicates,
+                                beta_batch=beta_train, h_batch=h_train)
+        else:
+            loss = loss_fn(log_rnd_train)
+
         # Synchronize loss across processes
         
-        logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model,
-                                                       beta_batch=beta_batch, h_batch=h_batch,
+        logf_t_vals, logp_x_vals = _compute_log_stats(x_train, log_rnd_train, reward_fn, model,
+                                                       beta_batch=beta_train, h_batch=h_train,
                                                        J=args.J if hasattr(args, 'J') else 1,
                                                        bias_potential=bias_potential,
                                                        cv_compute_fn=cv_compute_fn)
         vfe = logp_x_vals - logf_t_vals  # variational free energy
-        ess_train.append(ess(log_rnd))
+        ess_train.append(ess(log_rnd_train))
         info['ess_train'] = ess_train[-1]
         info['loss'] = loss.item()
         losses.append(loss.item())
@@ -612,10 +827,10 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                 "train/std_logp_x": logp_x_vals.std().item(),
                 "train/avg_logf_t": logf_t_vals.mean().item(),
                 "train/std_logf_t": logf_t_vals.std().item(),
-                "train/avg_log_rnd": log_rnd.mean().item(),
-                "train/std_log_rnd": log_rnd.std().item(),
-                "train/min_log_rnd": log_rnd.min().item(),
-                "train/max_log_rnd": log_rnd.max().item(),
+                "train/avg_log_rnd": log_rnd_train.mean().item(),
+                "train/std_log_rnd": log_rnd_train.std().item(),
+                "train/min_log_rnd": log_rnd_train.min().item(),
+                "train/max_log_rnd": log_rnd_train.max().item(),
             }
             
             # Log bias stats
@@ -643,8 +858,8 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
             # Log lattice visualization periodically (every 100 epochs)
             if L is not None and epoch % 100 == 0:
                 try:
-                    fig = _visualize_lattices(x, L, n_rows=2, n_cols=5, max_samples=10,
-                                              beta_batch=beta_batch, h_batch=h_batch)
+                    fig = _visualize_lattices(x_train, L, n_rows=2, n_cols=5, max_samples=10,
+                                              beta_batch=beta_train, h_batch=h_train)
                     log_dict["train/samples"] = wandb.Image(fig)
                     plt.close(fig)
                 except Exception as e:

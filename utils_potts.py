@@ -1,8 +1,9 @@
-import torch
-import numpy as np
-from tqdm import tqdm
-from matplotlib.colors import ListedColormap
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from matplotlib.colors import ListedColormap
+from tqdm import tqdm
+
 
 def potts2d_ham(S, J = 1, q = 3):
     """

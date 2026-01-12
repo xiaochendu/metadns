@@ -76,6 +76,8 @@ parser.add_argument('--n_heads', type=int, default=4, help='Number of attention 
 parser.add_argument('--dtype', type=str, default='bfloat16', help='Model data type')
 parser.add_argument('--use_checkpoint', action='store_true', help='Use gradient checkpointing')
 parser.add_argument('--scale_bias_with_size', action='store_true', help='Scale bias Delta_T with system size (essential for large L)')
+parser.add_argument('--buffer_size', type=int, default=0, help='Size of experience replay buffer')
+parser.add_argument('--buffer_ratio', type=float, default=0.0, help='Ratio of buffer samples in training batch')
 args = parser.parse_args()
 
 if args.use_anneal:
@@ -145,6 +147,8 @@ cfg = {'tokens': 2,
        'save_every': args.save_every,
        'J': J,
        'scale_bias_with_size': args.scale_bias_with_size,
+       'buffer_size': args.buffer_size,
+       'buffer_ratio': args.buffer_ratio}
 
 # Check batch size compatibility if using multiple temps/fields
 if len(temps) > 1 or len(fields) > 1:
@@ -298,7 +302,8 @@ if not args.use_anneal:
         wandb_run=wandb_run, L=L, bias_potential=bias_pot,
         current_fields=current_fields, rng=rng,
         save_dir=dir_name, cfg_dict=cfg,
-        cv_compute_fn=compute_cv_ising)
+        cv_compute_fn=compute_cv_ising,
+        buffer_size=args.buffer_size, buffer_ratio=args.buffer_ratio)
     
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")
@@ -334,7 +339,9 @@ else:
         model, optimizer, reward_fn_main, 
         Dict2Obj(cfg), device, num_epochs=args.num_epochs, 
         ema=ema, losses=losses, ess_train=ess_train, ess_eval=ess_eval,
-        wandb_run=wandb_run, L=L, save_dir=dir_name, cfg_dict=cfg)
+        wandb_run=wandb_run, L=L, save_dir=dir_name, cfg_dict=cfg,
+        buffer_size=args.buffer_size,
+        buffer_ratio=args.buffer_ratio)
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")
     save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg, f'{dir_name}/weights_final.pth', bias_pot)
