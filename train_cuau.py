@@ -232,12 +232,16 @@ def get_args():
     parser.add_argument("--use_bias", action="store_true", help="Use metadynamics bias")
     parser.add_argument("--bias_method", type=str, default="binned", choices=["binned", "gaussian"])
     parser.add_argument("--bias_sigma", type=float, default=0.05)
-    parser.add_argument("--bias_height", type=float, default=0.1)
+    parser.add_argument("--bias_height", type=float, default=0.1, 
+                        help="Initial bias height. For diffusion samplers with batch updates, this is normalized by batch_size by default (see --normalize_bias_by_batch)")
     parser.add_argument("--bias_factor", type=float, default=10.0)
     parser.add_argument("--bias_grid_size", type=int, default=100)
     parser.add_argument("--cv_min", type=float, default=0.0, help="Minimum CV value (default: 0.0 for Au concentration)")
     parser.add_argument("--cv_max", type=float, default=1.0, help="Maximum CV value (default: 1.0 for Au concentration)")
     parser.add_argument("--scale_bias_with_size", action="store_true")
+    parser.add_argument("--no_normalize_bias_by_batch", dest="normalize_bias_by_batch", action="store_false", default=True,
+                        help="Disable normalization of bias_height by batch_size (default: normalization enabled). Recommended for diffusion samplers that deposit bias more frequently than traditional MCMC.")
+    
     
     # Logging
     parser.add_argument("--out_dir", type=str, default="results/cuau")
@@ -379,6 +383,21 @@ def main():
         cv_min = args.cv_min  # Default 0.0 for concentration
         cv_max = args.cv_max  # Default 1.0 for concentration
         
+        # Normalize bias_height by batch_size for diffusion samplers
+        # Traditional metadynamics deposits 1 hill per step with height 0.1-0.5 kBT
+        # Diffusion samplers deposit batch_size hills per cycle, so normalize accordingly
+        # (Nam et al. 2020: "the Gaussian height h must be reduced, since diffusion 
+        #  samplers generate uncorrelated samples and thus deposit bias more frequently")
+        effective_bias_height = args.bias_height
+        if args.normalize_bias_by_batch:
+            effective_bias_height = args.bias_height / args.batch_size
+            total_bias_per_cycle = effective_bias_height * args.batch_size
+            kBT_ratio = args.bias_height / T_val if T_val > 0 else 0
+            print(f"Bias height normalization: {args.bias_height:.6f} eV -> {effective_bias_height:.8f} eV per hill")
+            print(f"  (Total per cycle: {total_bias_per_cycle:.6f} eV = {kBT_ratio:.3f} kBT, batch_size={args.batch_size})")
+        else:
+            print(f"Bias height (no normalization): {effective_bias_height:.6f} eV per hill")
+        
         print(f"Initializing Bias: sigma={args.bias_sigma}, factor={args.bias_factor}, CV range=[{cv_min}, {cv_max}]")
         print(f"Temperature: {T_kelvin} K = {T_val:.6f} eV (kB*T)")
         
@@ -388,7 +407,7 @@ def main():
             cv_max=cv_max,
             grid_size=args.bias_grid_size,
             sigma=args.bias_sigma,
-            initial_height=args.bias_height,
+            initial_height=effective_bias_height,
             bias_factor=args.bias_factor,
             T=T_val,  # Temperature in kB*T units (eV)
             kernel_type=kernel_type,
