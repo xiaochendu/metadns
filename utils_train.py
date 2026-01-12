@@ -993,7 +993,20 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                                     
                                 biased_reward_vals = logf_t_vals - beta_val * v_eval
                                 
-                            fig_bias = plot_bias_analysis(bias_potential, epoch, s_batch=s_eval, biased_reward=biased_reward_vals)
+                            # Sample from Replay Buffer for visualization if available
+                            s_buffer = None
+                            if replay_buffer is not None and replay_buffer.size > 0:
+                                n_sample = min(args.eval_batch_size, replay_buffer.size)
+                                x_buf, _, _ = replay_buffer.sample(n_sample)
+                                with torch.no_grad():
+                                    if cv_compute_fn is not None:
+                                        s_buffer = cv_compute_fn(x_buf.to(device))
+                                    else:
+                                        x_spins_buf = 2 * x_buf.to(device) - 1
+                                        s_buffer = ising2d_mag(x_spins_buf)
+                            fig_bias = plot_bias_analysis(bias_potential, epoch, s_batch=s_eval, 
+                                                          biased_reward=biased_reward_vals, 
+                                                          s_buffer=s_buffer)
                             if fig_bias is not None:
                                 wandb_run.log({"val/bias_analysis_plot": wandb.Image(fig_bias)}, step=epoch)
                                 plt.close(fig_bias)
