@@ -128,7 +128,7 @@ def cycleloader(dataloader):
             yield data
 
 
-def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None):
+def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None, num_sites=None):
     """
     Plots bias analysis:
     1. Estimated Free Energy F(s) (from Bias Potential)
@@ -138,6 +138,7 @@ def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None):
     
     s_batch: Tensor/Array of CV values from current batch
     log_rnd: Tensor/Array of log-RND values (log R_biased - log P_model)
+    num_sites: Optional number of sites/atoms/spins for per-site free energy calculation
     """
     try:
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
@@ -155,10 +156,27 @@ def plot_bias_analysis(bias_potential, epoch, s_batch=None, biased_reward=None):
         # Shift to zero minimum for relative interpretation
         # NOTE: Don't shift to better watch convergence
         # free_energy_profile = free_energy_profile - free_energy_profile.min()
+        
+        # Try to infer num_sites from energy_scaling if not provided
+        if num_sites is None and hasattr(bias_potential, 'energy_scaling'):
+            # energy_scaling = num_sites / 16.0 when scale_bias_with_size is True
+            # Only use if energy_scaling looks reasonable (>= 0.1 to avoid false positives when scale_bias_with_size is False)
+            if bias_potential.energy_scaling >= 0.1:
+                num_sites = int(bias_potential.energy_scaling * 16.0)
             
         axes[0].plot(grid_vals, free_energy_profile, label='F(s) Estimate', color='blue')
+        
+        # Add per-atom/spin free energy on second y-axis if num_sites is available
+        if num_sites is not None and num_sites > 0:
+            ax_twin = axes[0].twinx()
+            per_site_free_energy = free_energy_profile / num_sites
+            ax_twin.plot(grid_vals, per_site_free_energy, label='F(s)/N per site', color='red', linestyle='--')
+            ax_twin.set_ylabel('Energy per site', color='red')
+            ax_twin.tick_params(axis='y', labelcolor='red')
+            ax_twin.legend(loc='upper right')
+            
         axes[0].set_title(f'Est. Relative Free Energy (Ep {epoch})')
-        axes[0].set_xlabel('CV (Magnetization)')
+        axes[0].set_xlabel('CV')
         axes[0].set_ylabel('Energy')
         axes[0].grid(True)
         axes[0].legend()
