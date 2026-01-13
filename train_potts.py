@@ -36,6 +36,9 @@ parser.add_argument('--use_anneal', action='store_true')
 parser.add_argument('--anneal_beta', type=float, default=None)
 parser.add_argument('--anneal_epochs', type=int, default=None)
 parser.add_argument('--resume_from_ckpt', type=str, default=None)
+parser.add_argument('--loss_fn', type=str, default='wdce', help='Loss function: wdce or mse')
+parser.add_argument('--resample_every_n_step', type=int, default=10, help='Resample every n step')
+parser.add_argument('--wdce_num_replicates', type=int, default=8, help='WDCE number of replicates')
 # Metadynamics / Bias Potential
 parser.add_argument('--use_bias', action='store_true', help='Enable biased sampling (WT-ASBS)')
 parser.add_argument('--bias_sigma', type=str, default="0.05", help='Sigma for Gaussian bias kernel (can be list)')
@@ -121,12 +124,12 @@ cfg = {'tokens': q,
        'model': {'hidden_size': 128, 'n_blocks': 4, 'n_heads': 4, 'length': D,
                 'use_checkpoint': False, 'dtype': 'bfloat16'},
        'num_epochs': args.num_epochs, 
-       'resample_every_n_step': 10,
+       'resample_every_n_step': args.resample_every_n_step,
        'batch_size': args.batch_size,
        'eval_every': args.eval_every, 'eval_batch_size': args.eval_batch_size,
        'grad_clip': False, 'gradnorm_clip': 1,
-       'loss_fn': 'wdce',
-       'wdce_num_replicates': 8,
+       'loss_fn': args.loss_fn,
+       'wdce_num_replicates': args.wdce_num_replicates,
        'seed': None,
        'use_bias': args.use_bias,
        'bias_sigma': args.bias_sigma,

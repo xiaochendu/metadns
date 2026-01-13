@@ -67,6 +67,20 @@ For CuAu ($4\times4\times4$), with batch size $B=128$:
     - Standard Height ($0.1 \sim 0.5 k_B T$): $0.01034 \sim 0.0517 \text{ eV}$
     - Normalized Height ($/ 128$): **$0.00008 \sim 0.00040 \text{ eV}$**
 
+#### Potts Model q=3 (Temperature-dependent Choices)
+For Potts Model ($4\times4$, $q=3$), with batch size $B=128$:
+- **Low Temp ($T \approx 0.833, \beta=1.2$)**:
+    - Standard Height ($0.1 \sim 0.5 k_B T$): $0.0833 \sim 0.4165$. Recommended: **$0.0833$** 
+    - Normalized Height ($/ 128$): **$0.00065 \sim 0.00325$**. 
+- **Crit Temp ($T \approx 0.995, \beta=1.005$)**:
+    - Standard Height ($0.1 \sim 0.5 k_B T$): $0.0995 \sim 0.4975$. Recommended: **$0.0995$** 
+    - Normalized Height ($/ 128$): **$0.00078 \sim 0.00388$**. 
+- **High Temp ($T = 2.0, \beta=0.5$)**:
+    - Standard Height ($0.1 \sim 0.5 k_B T$): $0.2 \sim 1.0$. Recommended: **$0.2$** 
+    - Normalized Height ($/ 128$): **$0.00156 \sim 0.00781$**. 
+
+> Note: For Potts 4x4, we use 2D collective variables (CVs) based on state concentrations projected onto a triangular coordinate system. The CV bounds are typically set to `--cv_min "-0.6,-1.0" --cv_max "1.1,1.0"` with a grid size of 17. The bias height values shown above are the **raw heights** before batch normalization (which is applied automatically during training).
+
 ### Sample Commands
 
 Below are sample commands using the recommended settings.
@@ -80,13 +94,12 @@ python train_ising.py \
     --resample_every_n_step 10 \
     --wdce_num_replicates 10 \
     --use_bias \
-    --bias_sigma 0.02 \
-    --bias_height 0.001 \
+    --bias_sigma 0.05 \
+    --bias_height 0.1667 \
     --batch_size 256 \
     --hidden_size 64 \
     --n_blocks 6
 ```
-> Note: For Ising, `bias_height 0.001` with `batch_size 256` provides a robust base level of exploration.
 
 **CuAu 4x4x4 (Low Temp)**
 ```bash
@@ -104,13 +117,34 @@ python train_cuau.py \
     --n_layers 4
 ```
 
+**Potts 4x4 q=3 (Low Temp)**
+```bash
+python train_potts.py \
+    --L 4 \
+    --q 3 \
+    --beta 1.2 \
+    --J 1 \
+    --loss_fn wdce \
+    --resample_every_n_step 5 \
+    --wdce_num_replicates 16 \
+    --use_bias \
+    --bias_sigma "0.05" \
+    --bias_height 0.0833 \
+    --bias_factor 10 \
+    --bias_grid_size "17" \
+    --kernel_type "gaussian" \
+    --cv_min "-0.6,-1.0" \
+    --cv_max "1.1,1.0" \
+    --batch_size 128 \
+    --num_epochs 20000
+```
+> Note: For Potts 4x4, the model uses 128 embedding size, 4 blocks, and 4 heads (defaults in `train_potts.py`). The loss function defaults to `wdce` with `--resample_every_n_step 10` and `--wdce_num_replicates 8`, but these can be customized via command-line arguments. The example above uses `--resample_every_n_step 5` and `--wdce_num_replicates 16` for more frequent resampling. The bias height `0.4165` is automatically normalized by batch size during training.
+
 ### Replay Buffer
 You can also use an experience replay buffer to stabilize training by mixing in past samples.
 ```bash
 --buffer_size 1000 --buffer_ratio 0.5
 ```
-
-
 
 ## Evaluation
 We include evaluation and visualization script of Ising and Potts model in `ising_model_eval.ipynb` and `potts_model_eval.ipynb` respectively. 
