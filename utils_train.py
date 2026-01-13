@@ -8,6 +8,7 @@ import torch.distributed as dist
 import wandb
 from matplotlib.colors import ListedColormap
 from tqdm import tqdm
+
 from utils import ess, plot_bias_analysis, sample_categorical_logits
 from utils_ising import ising2d_mag
 
@@ -504,8 +505,8 @@ def _compute_log_stats(x, log_rnd, reward_fn, model, beta_batch=None, h_batch=No
 
 
 def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16, 
-                        beta_batch=None, h_batch=None):
-    """Visualize Ising lattices in a grid.
+                        beta_batch=None, h_batch=None, q=None):
+    """Visualize Ising or Potts lattices in a grid.
     
     Args:
         samples: Tensor of shape [B, L*L] or [B, L, L]
@@ -515,6 +516,7 @@ def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16,
         max_samples: Maximum number of samples to visualize
         beta_batch: [B] tensor of beta values (optional, for sampling from each temp)
         h_batch: [B] tensor of field values (optional, for sampling from each field)
+        q: Number of states (for Potts model). If None or 2, uses binary Ising visualization.
     """
     # Reshape if needed: [B, L*L] -> [B, L, L]
     if samples.ndim == 2:
@@ -567,8 +569,25 @@ def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16,
         n_plots = min(n_rows * n_cols, max_samples, samples.shape[0])
         samples_to_plot = samples[:n_plots]
     
-    # Create colormap for binary Ising (blue for 0, pink for 1)
-    palette = ["#1f77b4", "#e377c2"]
+    # Create colormap based on number of states
+    if q is None or q == 2:
+        # Binary Ising (blue for 0, pink for 1)
+        palette = ["#1f77b4", "#e377c2"]
+        vmax = 1
+    else:
+        # Potts model with q states
+        # Use distinct colors for each state
+        if q == 3:
+            palette = ["#540D6E", "#EE4266", "#FFD23F"]  # Purple, Pink, Yellow
+        elif q == 4:
+            palette = ["#540D6E", "#EE4266", "#FFD23F", "#26547c"]  # Add blue
+        else:
+            # For q > 4, use a colormap that can handle more states
+            from matplotlib.cm import get_cmap
+            cmap_obj = get_cmap('tab10')
+            palette = [cmap_obj(i / max(q-1, 1)) for i in range(q)]
+        vmax = q - 1
+    
     cmap = ListedColormap(palette)
     
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 1.5, n_rows * 1.5))
@@ -581,7 +600,7 @@ def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16,
     for i in range(n_plots):
         ax = axes[i]
         sample_np = samples_to_plot[i].numpy()
-        ax.imshow(sample_np, cmap=cmap, origin="lower", vmin=0, vmax=1)
+        ax.imshow(sample_np, cmap=cmap, origin="lower", vmin=0, vmax=vmax)
         ax.axis("off")
     
     # Hide unused subplots
@@ -596,7 +615,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
           losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None, 
           bias_potential=None, current_fields=None, rng=None, save_dir=None, cfg_dict=None,
           validation_plot_callback=None, cv_compute_fn=None,
-          buffer_size=0, buffer_ratio=0.0):
+          buffer_size=0, buffer_ratio=0.0, plot_bias_fn=None):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
                'wdce': loss_wdce}.get(args.loss_fn)
     if loss_fn is None:
@@ -858,8 +877,10 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
             # Log lattice visualization periodically (every 100 epochs)
             if L is not None and epoch % 100 == 0:
                 try:
+                    # Get q from cfg_dict if available (for Potts model)
+                    q = cfg_dict.get('q', None) if cfg_dict is not None else None
                     fig = _visualize_lattices(x_train, L, n_rows=2, n_cols=5, max_samples=10,
-                                              beta_batch=beta_train, h_batch=h_train)
+                                              beta_batch=beta_train, h_batch=h_train, q=q)
                     log_dict["train/samples"] = wandb.Image(fig)
                     plt.close(fig)
                 except Exception as e:
@@ -959,8 +980,10 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                     # Log lattice visualization during evaluation
                     if L is not None:
                         try:
+                            # Get q from cfg_dict if available (for Potts model)
+                            q = cfg_dict.get('q', None) if cfg_dict is not None else None
                             fig = _visualize_lattices(x, L, n_rows=2, n_cols=5, max_samples=10,
-                                                      beta_batch=eval_beta_batch, h_batch=eval_h_batch)
+                                                      beta_batch=eval_beta_batch, h_batch=eval_h_batch, q=q)
                             wandb_run.log({"val/samples": wandb.Image(fig)}, step=epoch)
                             plt.close(fig)
                         except Exception as e:
@@ -1002,9 +1025,14 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                                     if cv_compute_fn is not None:
                                         s_buffer = cv_compute_fn(x_buf.to(device))
                                     else:
+                                        # Backward compatible: default to Ising magnetization
                                         x_spins_buf = 2 * x_buf.to(device) - 1
                                         s_buffer = ising2d_mag(x_spins_buf)
-                            fig_bias = plot_bias_analysis(bias_potential, epoch, s_batch=s_eval, 
+                            
+                            # Use custom plot function if provided, else default
+                            plot_fn = plot_bias_fn if plot_bias_fn is not None else plot_bias_analysis
+                            
+                            fig_bias = plot_fn(bias_potential, epoch, s_batch=s_eval, 
                                                           biased_reward=biased_reward_vals, 
                                                           s_buffer=s_buffer)
                             if fig_bias is not None:

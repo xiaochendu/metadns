@@ -367,4 +367,165 @@ def plot_energy_au_conc_distributions(
     if wandb_run is not None and step is not None and HAS_WANDB:
         wandb_run.log({f"val/distributions{title_suffix}": wandb.Image(fig)}, step=step)
     
+    
     plt.close(fig)
+
+
+def plot_bias_analysis_2d(bias_potential, epoch, s_batch=None, biased_reward=None, num_sites=None, s_buffer=None, save_path=None, title_suffix="", **kwargs):
+    """
+    Plot 2D bias analysis:
+    1. 2D Histogram of CV samples (Raw Distribution P(s))
+    2. 2D Reweighted Distribution (Corrected Physical Distribution)
+    3. 2D Bias Potential Surface (Approximation of -F(s)) with per-site energy
+    4. Biased Reward vs CV (Target Landscape)
+    
+    Args:
+        bias_potential: BiasPotentialMultiDim instance
+        epoch: Current epoch
+        s_batch: [B, 2] Tensor or numpy array of CV values
+        biased_reward: [B] Tensor or numpy array of biased reward values
+        num_sites: Number of lattice sites (for per-site energy calculation)
+        s_buffer: Optional buffer samples [N, 2]
+        save_path: Path to save the figure
+        title_suffix: Optional suffix for plot titles
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import torch
+
+        # Get data
+        if hasattr(bias_potential, 'get_bias_grid_np'):
+            grid_coords, bias_grid = bias_potential.get_bias_grid_np()
+            # grid_coords is list of [G, G] arrays (meshgrid output)
+            X, Y = grid_coords[0], grid_coords[1]
+        else:
+            return # Not supported
+            
+        gamma = bias_potential.gamma
+        if gamma > 1.0:
+            free_energy_profile = - (gamma / (gamma - 1)) * bias_grid
+        else:
+            free_energy_profile = - bias_grid
+
+        # Try to infer num_sites from energy_scaling if not provided
+        if num_sites is None and hasattr(bias_potential, 'energy_scaling'):
+            # energy_scaling = num_sites / 16.0 when scale_bias_with_size is True
+            if bias_potential.energy_scaling >= 0.1:
+                num_sites = int(bias_potential.energy_scaling * 16.0)
+
+        # Process samples
+        if s_batch is not None:
+            if isinstance(s_batch, torch.Tensor):
+                samples_np = s_batch.detach().cpu().numpy()
+            else:
+                samples_np = s_batch
+        else:
+            samples_np = None
+            
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        axes = axes.flatten()
+        
+        # 1. Raw Distribution (Histogram) - Top Left
+        if samples_np is not None:
+            h = axes[0].hist2d(samples_np[:, 0], samples_np[:, 1], bins=50, 
+                            range=[[bias_potential.cv_min[0].item(), bias_potential.cv_max[0].item()],
+                                    [bias_potential.cv_min[1].item(), bias_potential.cv_max[1].item()]],
+                            cmap='viridis', density=True)
+            fig.colorbar(h[3], ax=axes[0], label='Density')
+        
+        if s_buffer is not None:
+            if isinstance(s_buffer, torch.Tensor):
+                buffer_np = s_buffer.detach().cpu().numpy()
+            else:
+                buffer_np = s_buffer
+            axes[0].scatter(buffer_np[:, 0], buffer_np[:, 1], s=1, c='red', alpha=0.3, label='Buffer')
+            axes[0].legend()
+
+        axes[0].set_title(f"Raw CV Distribution (Epoch {epoch}){title_suffix}")
+        axes[0].set_xlabel('CV 1 (x)')
+        axes[0].set_ylabel('CV 2 (y)')
+        
+        # 2. Reweighted Distribution (Corrected Physical Distribution) - Top Right
+        if samples_np is not None:
+            with torch.no_grad():
+                if not isinstance(s_batch, torch.Tensor):
+                    s_tens = torch.tensor(s_batch, device=bias_potential.device)
+                else:
+                    s_tens = s_batch.to(bias_potential.device)
+                    
+                v_s = bias_potential.evaluate(s_tens)  # [B]
+                # beta = 1/T
+                beta = 1.0 / bias_potential.T
+                log_weights = beta * v_s
+                # Shift for numerical stability
+                log_weights = log_weights - log_weights.max()
+                weights = torch.exp(log_weights).cpu().numpy()
+            
+            # Use weighted 2D histogram
+            h2 = axes[1].hist2d(samples_np[:, 0], samples_np[:, 1], bins=50,
+                               range=[[bias_potential.cv_min[0].item(), bias_potential.cv_max[0].item()],
+                                      [bias_potential.cv_min[1].item(), bias_potential.cv_max[1].item()]],
+                               weights=weights, cmap='viridis', density=True)
+            fig.colorbar(h2[3], ax=axes[1], label='Density')
+            
+            axes[1].set_title(f"Reweighted Distribution P(s) (Physical){title_suffix}")
+            axes[1].set_xlabel('CV 1 (x)')
+            axes[1].set_ylabel('CV 2 (y)')
+        else:
+            axes[1].axis('off')
+        
+        # 3. Bias Surface / Free Energy with Per-Site Overlay - Bottom Left
+        c = axes[2].contourf(X, Y, free_energy_profile, levels=20, cmap='coolwarm')
+        cbar1 = fig.colorbar(c, ax=axes[2], label='Energy')
+        axes[2].set_title(f"Est. Free Energy / Bias Surface{title_suffix}")
+        axes[2].set_xlabel('CV 1 (x)')
+        axes[2].set_ylabel('CV 2 (y)')
+        
+        # Add per-site energy as contour lines if num_sites is available
+        if num_sites is not None and num_sites > 0:
+            per_site_free_energy = free_energy_profile / num_sites
+            # Add contour lines for per-site energy
+            contours = axes[2].contour(X, Y, per_site_free_energy, levels=10, 
+                                       colors='black', alpha=0.3, linewidths=0.5, linestyles='--')
+            axes[2].clabel(contours, inline=True, fontsize=8, fmt='%.3f')
+            # Add second colorbar for per-site energy
+            # Create a new axis for the second colorbar
+            ax_twin = axes[2].twinx()
+            ax_twin.set_ylabel('Energy per site', color='black', rotation=270, labelpad=20)
+            ax_twin.tick_params(axis='y', labelcolor='black')
+            # Hide the y-axis ticks but keep the label
+            ax_twin.set_yticks([])
+        
+        # 4. Biased Reward vs CV (Target Landscape) - Bottom Right
+        if biased_reward is not None and samples_np is not None:
+            if isinstance(biased_reward, torch.Tensor):
+                r_np = biased_reward.detach().cpu().numpy()
+            else:
+                r_np = biased_reward
+            
+            # Create 2D scatter plot colored by reward value
+            scatter = axes[3].scatter(samples_np[:, 0], samples_np[:, 1], c=r_np, 
+                                     s=10, alpha=0.5, cmap='coolwarm', edgecolors='none')
+            cbar2 = fig.colorbar(scatter, ax=axes[3], label='Energy (-beta*H - beta*V)')
+            axes[3].set_title(f"Biased Reward vs CV (Target Landscape){title_suffix}")
+            axes[3].set_xlabel('CV 1 (x)')
+            axes[3].set_ylabel('CV 2 (y)')
+            axes[3].set_xlim(bias_potential.cv_min[0].item(), bias_potential.cv_max[0].item())
+            axes[3].set_ylim(bias_potential.cv_min[1].item(), bias_potential.cv_max[1].item())
+        else:
+            axes[3].axis('off')
+        
+        plt.tight_layout()
+        
+        if save_path:
+             plt.savefig(save_path, dpi=150)
+             
+        plt.close(fig)
+        return fig
+        
+    except Exception as e:
+        print(f"Error plotting 2D bias analysis: {e}")
+        import traceback
+        traceback.print_exc()
+        return None

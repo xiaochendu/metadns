@@ -3,7 +3,6 @@ from warnings import simplefilter
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-
 from model import ExponentialMovingAverage, get_rope_vit_model
 from utils import Dict2Obj, plot_loss_ess
 from utils_ising import ising2d_ham, ising2d_mag, reward_fn_ising
@@ -17,7 +16,6 @@ from pathlib import Path
 from pprint import pformat
 
 import wandb
-
 from bias import BiasPotential
 from utils_ising import ising2d_mag
 
@@ -36,6 +34,7 @@ parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--eval_batch_size', type=int, default=32)
 parser.add_argument('--eval_every', type=int, default=20)
 parser.add_argument('--loss_fn', type=str, default='wdce')
+parser.add_argument('--wdce_num_replicates', type=int, default=8)
 parser.add_argument('--resume_from_ckpt', type=str, default=None)
 parser.add_argument('--wandb', dest='use_wandb', action='store_true', help="Enable wandb logging")
 parser.add_argument('--no-wandb', dest='use_wandb', action='store_false', help="Disable wandb logging")
@@ -128,7 +127,7 @@ cfg = {'tokens': 2,
        'eval_batch_size': args.eval_batch_size,
        'grad_clip': False, 'gradnorm_clip': 1,
        'loss_fn': args.loss_fn,
-       'wdce_num_replicates': 8,
+       'wdce_num_replicates': args.wdce_num_replicates,
        'seed': None,
        'temps': temps,
        'fields': fields,

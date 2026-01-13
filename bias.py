@@ -180,3 +180,162 @@ class BiasPotential:
         # We assume params are consistent or handled by init, 
         # but we could optionally overwrite them if needed. 
         # For now, just loading the grid is the most critical part.
+
+
+class BiasPotentialMultiDim:
+    """
+    Bias Potential for Multi-Dimensional CVs.
+    """
+    def __init__(self, 
+                 cv_min, 
+                 cv_max, 
+                 grid_size, 
+                 sigma, 
+                 initial_height, 
+                 bias_factor, 
+                 T, 
+                 kernel_type='gaussian',
+                 device='cpu',
+                 energy_scaling=1.0):
+        # Normalize inputs to lists
+        if isinstance(cv_min, (int, float)): cv_min = [float(cv_min)]
+        if isinstance(cv_max, (int, float)): cv_max = [float(cv_max)]
+        
+        self.ndim = len(cv_min)
+        assert len(cv_max) == self.ndim, "cv_min/max length mismatch"
+        
+        if isinstance(grid_size, int) or isinstance(grid_size, str): 
+             # Handle str if passed from args like "100" or "100,100"
+             if isinstance(grid_size, str):
+                 if ',' in grid_size:
+                     grid_size = [int(g) for g in grid_size.split(',')]
+                 else:
+                     grid_size = int(grid_size)
+        
+        if isinstance(grid_size, int): grid_size = [grid_size] * self.ndim
+        if isinstance(grid_size, list) and len(grid_size) == 1 and self.ndim > 1:
+            grid_size = grid_size * self.ndim
+        
+        if isinstance(sigma, (int, float)) or isinstance(sigma, str):
+             if isinstance(sigma, str):
+                 if ',' in sigma:
+                     sigma = [float(s) for s in sigma.split(',')]
+                 else:
+                     sigma = float(sigma)
+                     
+        if isinstance(sigma, (int, float)): sigma = [float(sigma)] * self.ndim
+        if isinstance(sigma, list) and len(sigma) == 1 and self.ndim > 1:
+            sigma = sigma * self.ndim
+        
+        self.cv_min = torch.tensor(cv_min, device=device)
+        self.cv_max = torch.tensor(cv_max, device=device)
+        self.grid_size = torch.tensor(grid_size, device=device)
+        self.grid_shape = [int(g) for g in grid_size]
+        self.sigma = torch.tensor(sigma, device=device)
+        
+        self.initial_height = initial_height
+        self.gamma = bias_factor
+        self.T = T
+        self.kernel_type = kernel_type.lower()
+        self.device = device
+        self.energy_scaling = energy_scaling
+        
+        # Initialize N-D grid
+        coords = []
+        for i in range(self.ndim):
+            line = torch.linspace(float(self.cv_min[i]), float(self.cv_max[i]), int(self.grid_size[i]), device=device)
+            coords.append(line)
+        
+        self.grid_coords = torch.meshgrid(*coords, indexing='ij')
+        # Stack to (G1, ..., GN, N)
+        self.grid_vals = torch.stack(self.grid_coords, dim=-1)
+        self.bias_grid = torch.zeros(tuple(self.grid_shape), device=device)
+        
+        if self.gamma > 1.0:
+            self.delta_T = (self.gamma - 1) * self.T * self.energy_scaling
+        else:
+            self.delta_T = 1e9
+
+    def _get_gaussian_kernel(self, center):
+        # Center: [N]
+        # grid_vals: [G1, ..., GN, N]
+        diff_sq = (self.grid_vals - center) ** 2
+        exponent = - torch.sum(diff_sq / (2 * self.sigma**2), dim=-1)
+        return torch.exp(exponent)
+
+    def _get_indices(self, cv_val):
+        indices = []
+        for i in range(self.ndim):
+            val = cv_val[i]
+            vmin = self.cv_min[i]
+            vmax = self.cv_max[i]
+            gsize = self.grid_size[i]
+            
+            step = (vmax - vmin) / (gsize - 1)
+            idx_float = (val - vmin) / step
+            idx_long = torch.round(idx_float).long()
+            idx_long = torch.clamp(idx_long, 0, int(gsize) - 1)
+            indices.append(idx_long)
+        return tuple(indices)
+
+    def update(self, cv_batch):
+        """Update bias with [B, N] CV batch."""
+        cv_batch = cv_batch.to(self.device).float()
+        assert cv_batch.shape[1] == self.ndim
+        
+        for cv_val in cv_batch:
+            indices = self._get_indices(cv_val)
+            current_v = self.bias_grid[indices]
+            
+            scale_factor = torch.exp( - current_v / self.delta_T )
+            height = self.initial_height * scale_factor
+            
+            if self.kernel_type == 'delta':
+                self.bias_grid[indices] += height
+            elif self.kernel_type == 'gaussian':
+                kernel = self._get_gaussian_kernel(cv_val)
+                self.bias_grid += height * kernel
+
+    def evaluate(self, cv_batch):
+        """Evaluate bias for [B, N] CV batch."""
+        cv_batch = cv_batch.to(self.device).float()
+        assert cv_batch.shape[1] == self.ndim
+        
+        indices_list = []
+        for i in range(self.ndim):
+            val = cv_batch[:, i]
+            vmin = self.cv_min[i]
+            vmax = self.cv_max[i]
+            gsize = self.grid_size[i]
+            
+            step = (vmax - vmin) / (gsize - 1)
+            idx_float = (val - vmin) / step
+            idx_long = torch.round(idx_float).long()
+            idx_long = torch.clamp(idx_long, 0, int(gsize) - 1)
+            indices_list.append(idx_long)
+            
+        return self.bias_grid[tuple(indices_list)]
+
+    def get_bias_grid_np(self):
+        """Return grid for plotting (numpy)."""
+        coords_np = [c.detach().cpu().numpy() for c in self.grid_coords]
+        bias_np = self.bias_grid.detach().cpu().numpy()
+        return coords_np, bias_np
+
+    def state_dict(self):
+        return {
+            'bias_grid': self.bias_grid,
+            'params': {
+                'cv_min': self.cv_min.cpu().tolist(),
+                'cv_max': self.cv_max.cpu().tolist(),
+                'grid_size': self.grid_size.cpu().tolist(),
+                'sigma': self.sigma.cpu().tolist(),
+                'initial_height': self.initial_height,
+                'bias_factor': self.gamma,
+                'T': self.T, 'kernel_type': self.kernel_type
+            }
+        }
+        
+    def load_state_dict(self, state_dict):
+        self.bias_grid = state_dict['bias_grid'].to(self.device)
+
