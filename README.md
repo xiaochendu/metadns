@@ -149,6 +149,215 @@ You can also use an experience replay buffer to stabilize training by mixing in 
 ## Evaluation
 We include evaluation and visualization script of Ising and Potts model in `ising_model_eval.ipynb` and `potts_model_eval.ipynb` respectively. 
 
+## Sampling
+
+The `scripts/mdns_sampling.py` script allows you to sample from trained MDNS models. Below are example commands for each model type.
+
+### Basic Usage
+
+**Ising Model (16×16)**
+```bash
+python scripts/mdns_sampling.py \
+    --model-type ising \
+    --L 16 \
+    --embed-dim 64 \
+    --depth 6 \
+    --num-heads 4 \
+    --ckpt checkpoints/L_16_ising/ising_low.pth \
+    --temps 1.667 \
+    --fields 0.0 \
+    --J 1.0 \
+    --batch-size 1024 \
+    --num-samples 10000 \
+    --output-folder outputs/ising_16x16 \
+    --device cuda:0
+```
+
+**Potts Model q=3 (16×16)**
+```bash
+python scripts/mdns_sampling.py \
+    --model-type potts \
+    --L 16 \
+    --q 3 \
+    --embed-dim 128 \
+    --depth 4 \
+    --num-heads 4 \
+    --vocab-size 3 \
+    --ckpt checkpoints/L_16_potts/potts_low.pth \
+    --temps 0.8333 \
+    --fields 0.0 \
+    --J 1.0 \
+    --batch-size 1024 \
+    --num-samples 10000 \
+    --output-folder outputs/potts_16x16_q3 \
+    --device cuda:0
+```
+
+**CuAu Alloy (4×4×4)**
+```bash
+python scripts/mdns_sampling.py \
+    --model-type cuau \
+    --size 4 4 4 \
+    --embed-dim 64 \
+    --depth 4 \
+    --num-heads 4 \
+    --eci-file path/to/eci.json \
+    --input-file path/to/input.vasp \
+    --ckpt path/to/cuau_checkpoint.pth \
+    --temps 200.0 \
+    --fields 0.0 \
+    --batch-size 1024 \
+    --num-samples 10000 \
+    --output-folder outputs/cuau_4x4x4 \
+    --device cuda:0
+```
+
+### Sampling with Metadynamics (WT-ASBS)
+
+When using a checkpoint trained with metadynamics, the bias potential is automatically loaded from the checkpoint. You can also enable metadynamics during sampling by specifying bias parameters:
+
+**Ising with Metadynamics**
+```bash
+python scripts/mdns_sampling.py \
+    --model-type ising \
+    --L 16 \
+    --embed-dim 64 \
+    --depth 6 \
+    --num-heads 4 \
+    --ckpt checkpoints/L_16_ising/ising_low_metadynamics.pth \
+    --use_bias \
+    --bias_sigma 0.05 \
+    --bias_height 0.1667 \
+    --bias_factor 10.0 \
+    --bias_grid_size 100 \
+    --cv_min -1.0 \
+    --cv_max 1.0 \
+    --temps 1.667 \
+    --fields 0.0 \
+    --J 1.0 \
+    --batch-size 1024 \
+    --num-samples 10000 \
+    --output-folder outputs/ising_16x16_metadynamics \
+    --device cuda:0
+```
+
+**Potts q=3 with Metadynamics (2D CV)**
+```bash
+python scripts/mdns_sampling.py \
+    --model-type potts \
+    --L 16 \
+    --q 3 \
+    --embed-dim 128 \
+    --depth 4 \
+    --num-heads 4 \
+    --vocab-size 3 \
+    --ckpt checkpoints/L_16_potts/potts_low_metadynamics.pth \
+    --use_bias \
+    --bias_sigma 0.05 \
+    --bias_height 0.0833 \
+    --bias_factor 10.0 \
+    --bias_grid_size 17 \
+    --kernel_type gaussian \
+    --cv_min "-0.6,-1.0" \
+    --cv_max "1.1,1.0" \
+    --temps 0.8333 \
+    --fields 0.0 \
+    --J 1.0 \
+    --batch-size 1024 \
+    --num-samples 10000 \
+    --output-folder outputs/potts_16x16_q3_metadynamics \
+    --device cuda:0
+```
+
+**CuAu with Metadynamics**
+```bash
+python scripts/mdns_sampling.py \
+    --model-type cuau \
+    --size 4 4 4 \
+    --embed-dim 64 \
+    --depth 4 \
+    --num-heads 4 \
+    --eci-file path/to/eci.json \
+    --input-file path/to/input.vasp \
+    --ckpt path/to/cuau_metadynamics.pth \
+    --use_bias \
+    --bias_sigma 0.05 \
+    --bias_height 0.00172 \
+    --bias_factor 10.0 \
+    --bias_grid_size 100 \
+    --cv_min 0.0 \
+    --cv_max 1.0 \
+    --temps 200.0 \
+    --fields 0.0 \
+    --batch-size 1024 \
+    --num-samples 10000 \
+    --output-folder outputs/cuau_4x4x4_metadynamics \
+    --device cuda:0
+```
+
+### Key Parameters
+
+- **`--model-type`**: Model type: `ising`, `potts`, or `cuau`
+- **`--L`**: Lattice size (linear dimension) for Ising/Potts models. Must match the checkpoint.
+- **`--size`**: Supercell size `[nx, ny, nz]` for CuAu models. Must match the checkpoint.
+- **`--q`**: Number of states for Potts model (default: 3). Must match the checkpoint.
+- **`--embed-dim`**, **`--depth`**, **`--num-heads`**: Model architecture parameters. Must match the checkpoint.
+- **`--ckpt`**: Path to model checkpoint (required)
+- **`--temps`**: Temperatures to sample at (can specify multiple):
+  - For **Ising/Potts**: Dimensionless temperature $T = 1/\beta$ (e.g., `--temps 1.667 2.269 3.571` for $\beta=0.6, 0.44, 0.28$)
+  - For **CuAu**: Temperature in Kelvin (e.g., `--temps 200.0 680.0 1200.0`)
+- **`--fields`**: External fields/chemical potentials (can specify multiple):
+  - For **Ising/Potts**: Dimensionless field $h$ (e.g., `--fields 0.0 0.1 0.2`)
+  - For **CuAu**: Chemical potential in eV (e.g., `--fields 0.0 -0.2 0.2`)
+- **`--batch-size`**: Batch size for sampling (default: 1024)
+- **`--num-samples`**: Total number of samples per (temperature, field) condition (default: 4096)
+- **`--J`**: Interaction strength for Ising/Potts models (default: 1.0)
+- **`--use_bias`**: Enable metadynamics bias. If the checkpoint contains a bias potential, it will be loaded automatically. You can also specify bias parameters manually.
+- **`--bias_sigma`**: Width of Gaussian bias kernel (default: 0.05)
+- **`--bias_height`**: Initial bias height (default: 0.1)
+- **`--bias_factor`**: Bias factor $\gamma$ for Well-Tempered Metadynamics (default: 10.0)
+- **`--bias_grid_size`**: Grid size for CV discretization (default: 100)
+- **`--cv_min` / `--cv_max`**: CV bounds:
+  - For **Ising**: Single value (e.g., `--cv_min -1.0 --cv_max 1.0`)
+  - For **Potts**: Comma-separated 2D values (e.g., `--cv_min "-0.6,-1.0" --cv_max "1.1,1.0"`)
+  - For **CuAu**: Single value (e.g., `--cv_min 0.0 --cv_max 1.0`)
+
+> **Note**: Model architecture parameters (`--L`, `--embed-dim`, `--depth`, `--num-heads`, `--q` for Potts) must match those used during training. The script will attempt to load these from the checkpoint, but it's recommended to specify them explicitly to ensure compatibility.
+
+### Sampling Multiple Conditions
+
+You can sample at multiple temperatures and fields simultaneously. The script will generate samples for all combinations:
+
+```bash
+python scripts/mdns_sampling.py \
+    --model-type ising \
+    --L 16 \
+    --embed-dim 64 \
+    --depth 6 \
+    --num-heads 4 \
+    --ckpt checkpoints/L_16_ising/ising_low.pth \
+    --temps 1.667 2.269 3.571 \
+    --fields 0.0 0.1 \
+    --J 1.0 \
+    --batch-size 1024 \
+    --num-samples 10000 \
+    --output-folder outputs/ising_16x16_multitemp \
+    --device cuda:0
+```
+
+This will generate samples for 6 conditions: (T=1.667, h=0.0), (T=1.667, h=0.1), (T=2.269, h=0.0), (T=2.269, h=0.1), (T=3.571, h=0.0), (T=3.571, h=0.1).
+
+### Output
+
+The script saves results to a pickle file containing:
+- Sampled configurations for each (temperature, field) condition
+- Energies
+- Effective sample sizes (NESS)
+- Free energies
+- Bias potential grids (if metadynamics was used)
+- Collective variable values (if metadynamics was used)
+
+Results are saved to `{output-folder}/{output-name}` (default: `outputs/mdns/mdns_results.pkl`). The results dictionary is keyed by temperature and field values (e.g., `"1.6670K_h0.0000"`).
 
 ## Citation
 If you find our work and repo help, we would appreciate your citations :smiling_face_with_three_hearts:

@@ -2,7 +2,7 @@
 """
 Standalone script for running MDNS sampling and evaluation.
 Replicates functionality of mam_arm_sampling.py for MDNS models.
-Supports both Ising and CuAu models.
+Supports Ising, CuAu, and Potts models.
 """
 
 import argparse
@@ -25,13 +25,14 @@ from tqdm import tqdm
 # Add parent directory to path to allow imports from MDNS
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from bias import BiasPotential
+from bias import BiasPotential, BiasPotentialMultiDim
 from energy_cuau import K_B, AuCuAlloyModel
 from model import ExponentialMovingAverage, get_rope_vit_model
 from model.transformer import MultiOutputTransformer
 from train_cuau import CuAuRewardWrapper, TransformerWrapper
 from utils import ess
 from utils_ising import ising2d_ham, ising2d_mag
+from utils_potts import potts2d_ham, potts2d_magnetization_all
 from utils_train import _compute_log_stats, rnd
 
 # Try to import clease/icet for CuAu setup
@@ -52,20 +53,23 @@ logger = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run sampling for MDNS model over temperatures and fields. Supports both Ising and CuAu models."
+        description="Run sampling for MDNS model over temperatures and fields. Supports Ising, CuAu, and Potts models."
     )
     
     # Model type
-    parser.add_argument("--model-type", type=str, default="ising", choices=["ising", "cuau"],
-                       help="Model type: 'ising' or 'cuau'")
+    parser.add_argument("--model-type", type=str, default="ising", choices=["ising", "cuau", "potts"],
+                       help="Model type: 'ising', 'cuau', or 'potts'")
     
     # Model arguments (common)
-    parser.add_argument("--L", type=int, default=16, help="Lattice size (Linear dimension) for Ising")
+    parser.add_argument("--L", type=int, default=16, help="Lattice size (Linear dimension) for Ising/Potts")
     parser.add_argument("--size", type=int, nargs=3, default=[2, 2, 4], help="Supercell size [nx, ny, nz] for CuAu")
     parser.add_argument("--embed-dim", type=int, default=64, help="Embedding dimension")
     parser.add_argument("--depth", type=int, default=4, help="Transformer depth")
     parser.add_argument("--num-heads", type=int, default=4, help="Number of attention heads")
     parser.add_argument("--vocab-size", type=int, default=3, help="Vocab size (default 3 for MDNS)")
+    
+    # Potts-specific arguments
+    parser.add_argument("--q", type=int, default=3, help="Number of states for Potts model (q)")
     
     # CuAu-specific arguments
     parser.add_argument("--eci-file", type=str, default=None, help="Path to ECI JSON file for CuAu")
@@ -78,8 +82,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--bias_factor', type=float, default=10.0, help='Bias factor (gamma) for Well-Tempered Metadynamics')
     parser.add_argument('--bias_grid_size', type=int, default=100, help='Grid size for CV')
     parser.add_argument('--kernel_type', type=str, default='gaussian', help='Kernel type: gaussian or delta')
-    parser.add_argument('--cv_min', type=float, default=None, help='Minimum value for CV (default: -1.0 for Ising, 0.0 for CuAu)')
-    parser.add_argument('--cv_max', type=float, default=None, help='Maximum value for CV (default: 1.0 for Ising, 1.0 for CuAu)')
+    parser.add_argument('--cv_min', type=str, default=None, help='Minimum value for CV (default: -1.0 for Ising, 0.0 for CuAu). For 2D CVs (Potts), use comma-separated values like "-0.6,-1.0"')
+    parser.add_argument('--cv_max', type=str, default=None, help='Maximum value for CV (default: 1.0 for Ising, 1.0 for CuAu). For 2D CVs (Potts), use comma-separated values like "1.1,1.0"')
     
     # Checkpoint
     parser.add_argument(
@@ -147,11 +151,37 @@ def parse_args() -> argparse.Namespace:
     
     args = parser.parse_args()
     
+    # Parse cv_min and cv_max (can be comma-separated for 2D CVs)
+    def parse_cv_value(cv_str, default):
+        if cv_str is None:
+            return default
+        if ',' in str(cv_str):
+            # Comma-separated values for 2D CV
+            return tuple(float(x.strip()) for x in str(cv_str).split(','))
+        else:
+            # Single value for 1D CV
+            return float(cv_str)
+    
     # Set default CV ranges based on model type
     if args.cv_min is None:
-        args.cv_min = 0.0 if args.model_type == "cuau" else -1.0
+        if args.model_type == "cuau":
+            args.cv_min = 0.0
+        elif args.model_type == "potts":
+            # For Potts with q=3, CV is 2D, default is (-0.6, -1.0)
+            args.cv_min = (-0.6, -1.0)
+        else:  # ising
+            args.cv_min = -1.0
+    else:
+        args.cv_min = parse_cv_value(args.cv_min, args.cv_min)
+    
     if args.cv_max is None:
-        args.cv_max = 1.0  # Same for both
+        if args.model_type == "potts":
+            # For Potts with q=3, CV is 2D, default is (1.1, 1.0)
+            args.cv_max = (1.1, 1.0)
+        else:
+            args.cv_max = 1.0
+    else:
+        args.cv_max = parse_cv_value(args.cv_max, args.cv_max)
     
     return args
 
@@ -268,6 +298,18 @@ def load_model(args, device):
         ).to(device)
         
         model = TransformerWrapper(base_net, vocab_size=vocab_size, length=num_sites, device=device)
+    elif args.model_type == "potts":
+        # Load Potts model (RopeVIT, similar to Ising but with vocab_size=q+1)
+        vocab_size = args.q + 1  # Potts uses q+1 vocab size (0..q-1 states + padding)
+        model = get_rope_vit_model(
+            L=args.L,
+            embed_dim=args.embed_dim,
+            depth=args.depth,
+            num_heads=args.num_heads,
+            vocab_size=vocab_size,
+            device=device
+        )
+        energy_model = None
     else:
         # Load Ising model (RopeVIT)
         model = get_rope_vit_model(
@@ -359,7 +401,7 @@ def load_model(args, device):
                 
                 # Get T from params
                 # For CuAu checkpoints, T is already in eV (converted during training in train_cuau.py line 375)
-                # For Ising checkpoints, T might be in different units - check if > 100 (likely Kelvin)
+                # For Ising/Potts checkpoints, T might be in different units - check if > 100 (likely Kelvin)
                 T_val = params.get('T', T_init)
                 if args.model_type == "cuau":
                     # CuAu checkpoints always store T in eV - don't convert
@@ -369,35 +411,114 @@ def load_model(args, device):
                         T_val = K_B * T_val
                     else:
                         logger.info(f"Using bias T from checkpoint as-is: {T_val} eV")
-                elif isinstance(T_val, (int, float)) and T_val > 100.0:
-                    # For Ising, if T > 100, likely in Kelvin (though Ising typically uses dimensionless beta)
-                    logger.warning(f"Bias potential T value {T_val} seems to be in Kelvin. Converting.")
-                    T_val = K_B * T_val
+                elif args.model_type in ["ising", "potts"]:
+                    # For Ising/Potts, if T > 100, likely in Kelvin (though typically uses dimensionless beta)
+                    if isinstance(T_val, (int, float)) and T_val > 100.0:
+                        logger.warning(f"Bias potential T value {T_val} seems to be in Kelvin. Converting.")
+                        T_val = K_B * T_val
                 
-                bias_pot = BiasPotential(
-                    cv_min=params.get('cv_min', args.cv_min), 
-                    cv_max=params.get('cv_max', args.cv_max), 
-                    grid_size=params.get('grid_size', args.bias_grid_size),
-                    sigma=params.get('sigma', args.bias_sigma),
-                    initial_height=params.get('initial_height', args.bias_height),
-                    bias_factor=params.get('bias_factor', args.bias_factor),
-                    T=T_val,
-                    kernel_type=params.get('kernel_type', args.kernel_type),
-                    device=device
-                )
+                # Use BiasPotentialMultiDim for Potts (2D CV), BiasPotential for Ising (1D CV)
+                if args.model_type == "potts":
+                    # Convert cv_min, cv_max, grid_size, sigma to lists if needed
+                    def to_list(val):
+                        if isinstance(val, tuple):
+                            return list(val)
+                        elif isinstance(val, (int, float)):
+                            return [val]
+                        return val
+                    
+                    cv_min_val = params.get('cv_min', args.cv_min)
+                    cv_max_val = params.get('cv_max', args.cv_max)
+                    grid_size_val = params.get('grid_size', args.bias_grid_size)
+                    sigma_val = params.get('sigma', args.bias_sigma)
+                    
+                    # Parse grid_size if it's a string
+                    if isinstance(grid_size_val, str):
+                        if ',' in grid_size_val:
+                            grid_size_val = [int(x) for x in grid_size_val.split(',')]
+                        else:
+                            grid_size_val = int(grid_size_val)
+                    
+                    # Parse sigma if it's a string
+                    if isinstance(sigma_val, str):
+                        if ',' in sigma_val:
+                            sigma_val = [float(x) for x in sigma_val.split(',')]
+                        else:
+                            sigma_val = float(sigma_val)
+                    
+                    bias_pot = BiasPotentialMultiDim(
+                        cv_min=to_list(cv_min_val),
+                        cv_max=to_list(cv_max_val),
+                        grid_size=grid_size_val,
+                        sigma=to_list(sigma_val) if not isinstance(sigma_val, list) else sigma_val,
+                        initial_height=params.get('initial_height', args.bias_height),
+                        bias_factor=params.get('bias_factor', args.bias_factor),
+                        T=T_val,
+                        kernel_type=params.get('kernel_type', args.kernel_type),
+                        device=device
+                    )
+                else:
+                    bias_pot = BiasPotential(
+                        cv_min=params.get('cv_min', args.cv_min), 
+                        cv_max=params.get('cv_max', args.cv_max), 
+                        grid_size=params.get('grid_size', args.bias_grid_size),
+                        sigma=params.get('sigma', args.bias_sigma),
+                        initial_height=params.get('initial_height', args.bias_height),
+                        bias_factor=params.get('bias_factor', args.bias_factor),
+                        T=T_val,
+                        kernel_type=params.get('kernel_type', args.kernel_type),
+                        device=device
+                    )
             else:
                 # Fallback to CLI args if params not inside state_dict
                 logger.warning("Bias params not found in checkpoint state dict! Using CLI arguments.")
-                bias_pot = BiasPotential(
-                    cv_min=args.cv_min, cv_max=args.cv_max, 
-                    grid_size=args.bias_grid_size,
-                    sigma=args.bias_sigma,
-                    initial_height=args.bias_height,
-                    bias_factor=args.bias_factor,
-                    T=T_init,
-                    kernel_type=args.kernel_type,
-                    device=device
-                )
+                if args.model_type == "potts":
+                    # Parse comma-separated values for Potts 2D CV
+                    def parse_list_arg(arg):
+                        if isinstance(arg, tuple):
+                            return list(arg)
+                        elif isinstance(arg, str) and ',' in arg:
+                            return [float(x.strip()) for x in arg.split(',')]
+                        elif isinstance(arg, (int, float)):
+                            return [float(arg)]
+                        return arg
+                    
+                    # Parse grid_size
+                    grid_size_val = args.bias_grid_size
+                    if isinstance(grid_size_val, str) and ',' in grid_size_val:
+                        grid_size_val = [int(x.strip()) for x in grid_size_val.split(',')]
+                    elif isinstance(grid_size_val, (int, str)):
+                        grid_size_val = int(grid_size_val) if isinstance(grid_size_val, str) else grid_size_val
+                    
+                    # Parse sigma
+                    sigma_val = args.bias_sigma
+                    if isinstance(sigma_val, str) and ',' in sigma_val:
+                        sigma_val = [float(x.strip()) for x in sigma_val.split(',')]
+                    elif isinstance(sigma_val, (int, float, str)):
+                        sigma_val = float(sigma_val) if isinstance(sigma_val, str) else sigma_val
+                    
+                    bias_pot = BiasPotentialMultiDim(
+                        cv_min=parse_list_arg(args.cv_min),
+                        cv_max=parse_list_arg(args.cv_max),
+                        grid_size=grid_size_val,
+                        sigma=parse_list_arg(sigma_val) if not isinstance(sigma_val, list) else sigma_val,
+                        initial_height=args.bias_height,
+                        bias_factor=args.bias_factor,
+                        T=T_init,
+                        kernel_type=args.kernel_type,
+                        device=device
+                    )
+                else:
+                    bias_pot = BiasPotential(
+                        cv_min=args.cv_min, cv_max=args.cv_max, 
+                        grid_size=args.bias_grid_size,
+                        sigma=args.bias_sigma,
+                        initial_height=args.bias_height,
+                        bias_factor=args.bias_factor,
+                        T=T_init,
+                        kernel_type=args.kernel_type,
+                        device=device
+                    )
             
             bias_pot.load_state_dict(bias_state)
             
@@ -417,23 +538,78 @@ def load_model(args, device):
                             f"For metadynamics, all sampling temperatures must match the training temperature."
                         )
                 logger.info(f"✓ All sampling temperatures match training temperature ({training_T_k:.2f}K = {training_T_ev:.6f} eV)")
+            elif args.use_bias and args.model_type in ["ising", "potts"] and args.temps:
+                # For Ising/Potts, temperature is dimensionless (beta = 1/T)
+                training_T = bias_pot.T  # Already in dimensionless units
+                
+                # Check all sampling temperatures match
+                for sampling_temp in args.temps:
+                    tolerance = 0.01  # Allow small difference
+                    if abs(sampling_temp - training_T) > tolerance:
+                        raise ValueError(
+                            f"Sampling temperature ({sampling_temp}) does not match "
+                            f"bias potential training temperature ({training_T}). "
+                            f"For metadynamics, all sampling temperatures must match the training temperature."
+                        )
+                logger.info(f"✓ All sampling temperatures match training temperature ({training_T})")
             
             # Normalize bias potential (shift min to 0) to avoid numerical explosion in weights
-            logger.info("Normalizing bias potential (shifting min to 0)...")
-            bias_pot.normalize()
+            # Note: BiasPotentialMultiDim doesn't have normalize() method
+            if hasattr(bias_pot, 'normalize'):
+                logger.info("Normalizing bias potential (shifting min to 0)...")
+                bias_pot.normalize()
+            else:
+                logger.info("Skipping normalization (BiasPotentialMultiDim doesn't support it)")
             
         else:
             logger.warning("Bias potential requested but not found in checkpoint! Using initialized (empty/initial) bias from CLI args.")
-            bias_pot = BiasPotential(
-                cv_min=args.cv_min, cv_max=args.cv_max, 
-                grid_size=args.bias_grid_size,
-                sigma=args.bias_sigma,
-                initial_height=args.bias_height,
-                bias_factor=args.bias_factor,
-                T=T_init,
-                kernel_type=args.kernel_type,
-                device=device
-            )
+            if args.model_type == "potts":
+                # Parse comma-separated values for Potts 2D CV
+                def parse_list_arg(arg):
+                    if isinstance(arg, tuple):
+                        return list(arg)
+                    elif isinstance(arg, str) and ',' in arg:
+                        return [float(x.strip()) for x in arg.split(',')]
+                    elif isinstance(arg, (int, float)):
+                        return [float(arg)]
+                    return arg
+                
+                # Parse grid_size
+                grid_size_val = args.bias_grid_size
+                if isinstance(grid_size_val, str) and ',' in grid_size_val:
+                    grid_size_val = [int(x.strip()) for x in grid_size_val.split(',')]
+                elif isinstance(grid_size_val, (int, str)):
+                    grid_size_val = int(grid_size_val) if isinstance(grid_size_val, str) else grid_size_val
+                
+                # Parse sigma
+                sigma_val = args.bias_sigma
+                if isinstance(sigma_val, str) and ',' in sigma_val:
+                    sigma_val = [float(x.strip()) for x in sigma_val.split(',')]
+                elif isinstance(sigma_val, (int, float, str)):
+                    sigma_val = float(sigma_val) if isinstance(sigma_val, str) else sigma_val
+                
+                bias_pot = BiasPotentialMultiDim(
+                    cv_min=parse_list_arg(args.cv_min),
+                    cv_max=parse_list_arg(args.cv_max),
+                    grid_size=grid_size_val,
+                    sigma=parse_list_arg(sigma_val) if not isinstance(sigma_val, list) else sigma_val,
+                    initial_height=args.bias_height,
+                    bias_factor=args.bias_factor,
+                    T=T_init,
+                    kernel_type=args.kernel_type,
+                    device=device
+                )
+            else:
+                bias_pot = BiasPotential(
+                    cv_min=args.cv_min, cv_max=args.cv_max, 
+                    grid_size=args.bias_grid_size,
+                    sigma=args.bias_sigma,
+                    initial_height=args.bias_height,
+                    bias_factor=args.bias_factor,
+                    T=T_init,
+                    kernel_type=args.kernel_type,
+                    device=device
+                )
 
     model.eval()
     
@@ -479,6 +655,53 @@ def run_sampling(
         spins = 2 * x.float() - 1
         return ising2d_mag(spins)
     
+    def compute_cv_potts(x):
+        """Compute CV for Potts model.
+        
+        For q=3, returns 2D projection: [proj_x, proj_y]
+        For other q, returns first q-1 concentrations.
+        
+        Args:
+            x: Input configurations [B, L*L] with values in {0, 1, ..., q-1}
+        """
+        if isinstance(x, torch.Tensor):
+            x_np = x.detach().cpu().numpy()
+        else:
+            x_np = x
+        
+        # Reshape to B, D
+        if x_np.ndim == 1:
+            x_np = x_np.reshape(1, -1)
+        
+        B, D_ = x_np.shape
+        q = args.q
+        
+        # Count frequencies for each state 0..q-1
+        # counts: [B, q]
+        counts = np.zeros((B, q))
+        for i in range(q):
+            counts[:, i] = np.sum(x_np == i, axis=1)
+        
+        concentrations = counts / D_  # [B, q]
+        
+        if q == 3:
+            # 2D projection for q=3:
+            # x = c1 - 0.5 * (c2 + c3)
+            # y = (sqrt(3)/2) * (c2 - c3)
+            c1 = concentrations[:, 0]
+            c2 = concentrations[:, 1]
+            c3 = concentrations[:, 2]
+            
+            proj_x = c1 - 0.5 * (c2 + c3)
+            proj_y = (np.sqrt(3)/2) * (c2 - c3)
+            
+            # Stack [B, 2]
+            cv = np.stack([proj_x, proj_y], axis=1)
+            return torch.tensor(cv, device=x.device if isinstance(x, torch.Tensor) else device, dtype=torch.float32)
+        else:
+            # Fallback for q!=3: return first q-1 concentrations
+            return torch.tensor(concentrations[:, :-1], device=x.device if isinstance(x, torch.Tensor) else device, dtype=torch.float32)
+    
     def compute_cv_cuau(x, energy_model_arg=None):
         """Compute Au concentration CV for CuAu alloy.
         
@@ -496,28 +719,39 @@ def run_sampling(
             return energy_model.get_concentrations(x)
     
     # Select CV computation function based on model type
-    if args.model_type == "cuau":
-        if energy_model is None:
-            raise ValueError("Energy model required for CuAu sampling")
-        cv_compute_fn = compute_cv_cuau
-        
-        def get_reward_fn(default_temp_k, default_field, bias_pot=None):
-            # Create CuAuRewardWrapper
-            # CuAuRewardWrapper handles bias internally if bias_potential and cv_compute_fn are provided
-            reward_wrapper = CuAuRewardWrapper(
-                energy_model, 
-                vocab_map={0: 29, 1: 79}, 
-                default_temp_k=default_temp_k
-            )
+    if args.model_type == "potts":
+        cv_compute_fn = compute_cv_potts
+        # Potts reward function
+        def get_reward_fn(default_beta, default_h, J=1, bias_pot=None):
+            def reward_fn(x, beta=None, h=None, J=J, **kwargs):
+                """Reward function for Potts model."""
+                beta_val = beta if beta is not None else default_beta
+                # Potts reward: -beta * H
+                return -beta_val * potts2d_ham(x, J=J, q=args.q)
             
-            def reward_fn(x, beta=None, h=None, J=1, **kwargs):
-                # For CuAu, beta is inverse temperature: beta = 1/(kB*T)
-                # CuAuRewardWrapper handles the conversion internally
-                return reward_wrapper(x, beta=beta, h=h, J=J, use_bias=args.use_bias,
-                                     bias_potential=bias_pot, cv_compute_fn=cv_compute_fn)
+            def biased_reward_fn(x, beta=None, h=None, J=J, use_bias=True):
+                # 1. Standard reward
+                r = reward_fn(x, beta=beta, h=h, J=J)
+                
+                # 2. Add Bias: R' = R - beta * V(s)
+                if bias_pot is not None and use_bias:
+                    s = compute_cv_potts(x)
+                    v = bias_pot.evaluate(s)
+                    
+                    # Get beta for scaling
+                    beta_val = beta if beta is not None else default_beta
+                    # Handle tensor/scalar beta
+                    if isinstance(beta_val, (int, float)):
+                        beta_tensor = torch.tensor(beta_val, device=x.device)
+                    elif isinstance(beta_val, torch.Tensor):
+                        beta_tensor = beta_val.to(x.device)
+                    else:
+                        beta_tensor = torch.tensor(beta_val, device=x.device)
+                    
+                    r = r - beta_tensor * v
+                return r
             
-            return reward_fn
-            
+            return biased_reward_fn if args.use_bias else reward_fn
     else:
         # Ising reward function
         cv_compute_fn = compute_cv_ising
@@ -587,7 +821,9 @@ def run_sampling(
             # Create condition-specific reward function (closure over beta/field or temp/field)
             if args.model_type == "cuau":
                 current_reward_fn = get_reward_fn(default_temp_k=temp_k, default_field=field, bias_pot=bias_pot)
-            else:
+            elif args.model_type == "potts":
+                current_reward_fn = get_reward_fn(default_beta=beta, default_h=field, J=args.J, bias_pot=bias_pot)
+            else:  # ising
                 current_reward_fn = get_reward_fn(default_beta=beta, default_h=field, J=args.J, bias_pot=bias_pot)
             
             while samples_collected < args.num_samples:
@@ -595,7 +831,7 @@ def run_sampling(
                 with torch.no_grad():
                     # Handle conditional vs unconditional
                     if has_conditioning:
-                        # For CuAu, pass temp in Kelvin; for Ising, pass beta
+                        # For CuAu, pass temp in Kelvin; for Ising/Potts, pass beta
                         if args.model_type == "cuau":
                             temp_batch = torch.full((current_batch_size,), temp_k, device=device).float()
                             field_batch = torch.full((current_batch_size,), field, device=device).float()
@@ -603,7 +839,7 @@ def run_sampling(
                             # CuAuRewardWrapper will handle the conversion
                             beta_batch = 1.0 / (K_B * temp_batch)
                             h_batch = field_batch
-                        else:
+                        else:  # ising or potts
                             beta_batch = torch.full((current_batch_size,), beta, device=device).float()
                             h_batch = torch.full((current_batch_size,), field, device=device).float()
                         
@@ -643,7 +879,7 @@ def run_sampling(
                             h_batch=None,
                             J=args.J,
                             bias_potential=bias_pot,
-                            cv_compute_fn=cv_compute_fn if args.model_type == "cuau" else None
+                            cv_compute_fn=cv_compute_fn if args.model_type in ["cuau", "potts"] else None
                         )
                     
                     log_rw = logf_t - logp_x
@@ -656,12 +892,27 @@ def run_sampling(
                         raw_energy = energy_model.get_energy(x)  # [B] in eV
                         # Au concentration (x_up)
                         cv_val = energy_model.get_concentrations(x)  # [B]
-                    else:
+                        cv_val_for_bias = cv_val  # Same for CuAu
+                    elif args.model_type == "potts":
+                        # For Potts, use potts2d_ham
+                        raw_energy = potts2d_ham(x, J=args.J, q=args.q)  # [B]
+                        # CV (magnetization-like) - using CV computation function
+                        cv_val_full = compute_cv_potts(x)  # May be 2D for q=3
+                        # For storage in x_up, use first component or magnitude for 2D CV
+                        if cv_val_full.ndim > 1 and cv_val_full.shape[1] > 1:
+                            # For 2D CV, store the first component for x_up
+                            cv_val = cv_val_full[:, 0] if cv_val_full.shape[1] >= 1 else cv_val_full.squeeze()
+                        else:
+                            cv_val = cv_val_full
+                        # Use full CV for bias evaluation
+                        cv_val_for_bias = cv_val_full
+                    else:  # ising
                         # For Ising, use ising2d_ham
                         spins = 2 * x.float() - 1
                         raw_energy = ising2d_ham(spins, J=args.J, h=field)
                         # Magnetization (x_up) - using CV computation function
                         cv_val = compute_cv_ising(x)
+                        cv_val_for_bias = cv_val  # Same for Ising
                     
                     # Store batch
                     batch_configs.append(x.cpu().numpy())
@@ -675,12 +926,13 @@ def run_sampling(
                     if bias_pot is not None:
                         # Calculate unbiasing weights = exp(beta_current * V(s))
                         # where beta_current is for the CURRENT sampling temperature (not training temperature!)
-                        # s is the CV value (magnetization for Ising, Au concentration for CuAu)
-                        v_s = bias_pot.evaluate(cv_val)  # [B] in eV (bias potential values)
+                        # s is the CV value (magnetization for Ising, Au concentration for CuAu, or 2D projection for Potts)
+                        # Use full CV for bias evaluation (important for Potts with 2D CV)
+                        v_s = bias_pot.evaluate(cv_val_for_bias)  # [B] in eV (bias potential values)
                         
                         # Use bias_pot.T for unbiasing (validated to match sampling temperature above)
                         # Since sampling temp matches training temp, we can use the stored T
-                        beta_bias = 1.0 / bias_pot.T  # in 1/eV for CuAu, or dimensionless for Ising
+                        beta_bias = 1.0 / bias_pot.T  # in 1/eV for CuAu, or dimensionless for Ising/Potts
                         
                         # Log-weights: log_w = beta_bias * V(s)
                         # This removes the bias: p_unbiased(x) = p_biased(x) * exp(beta * V(s))
@@ -731,10 +983,10 @@ def run_sampling(
             log_rw_tensor = torch.tensor(log_rw_values[key], device=device)
             log_Z = torch.logsumexp(log_rw_tensor, dim=0) - np.log(len(log_rw_tensor))
             
-            # For CuAu, use temperature in Kelvin; for Ising, use beta
+            # For CuAu, use temperature in Kelvin; for Ising/Potts, use beta
             if args.model_type == "cuau":
                 f_val = -(K_B * temp_k) * log_Z  # F = -kB*T*log(Z) in eV
-            else:
+            else:  # ising or potts
                 f_val = -(1.0/beta) * log_Z  # F = -(1/beta)*log(Z)
             
             free_energies[key] = f_val.item()
@@ -791,6 +1043,7 @@ def run_sampling(
                     # bias_vals is in eV (from BiasPotential with T in eV)
                     # Convert to kB*T units for display
                     free_energy_profile = free_energy_profile / (K_B * temp_k)
+                # For Ising/Potts, bias_vals is already in dimensionless units, no conversion needed
                     
                 # Shift so that the ends are zero (as requested)
                 # Average of ends to be robust
