@@ -616,33 +616,66 @@ def plot_1d_projected_energy(energy_grid_2d, cv_grid_coords,
     if project_dim == 0:
         # Project onto x: marginalize over y
         # F(x) = -kT * log(∫ exp(-F(x,y)/kT) dy)
+        # Extract 1D coordinate arrays from meshgrid
+        # cv_grid_coords[0] is (nx, ny) meshgrid where rows are constant
+        # cv_grid_coords[1] is (nx, ny) meshgrid where columns are constant
+        if cv_grid_coords[1].ndim == 2:
+            # Extract 1D y-coords from first row of meshgrid
+            y_coords_1d = cv_grid_coords[1][0, :]
+        else:
+            y_coords_1d = cv_grid_coords[1]
+        
         exp_neg_energy = np.exp(-energy_grid_2d / kT)  # [nx, ny]
         integral = np.trapz(
-            exp_neg_energy, x=cv_grid_coords[1], axis=1)  # [nx]
+            exp_neg_energy, x=y_coords_1d, axis=1)  # [nx]
         # [nx] (add small epsilon for numerical stability)
         f_projected = -kT * np.log(integral + 1e-10)
-        cv_coords = cv_grid_coords[0]
+        
+        # Extract 1D x-coords from first column of meshgrid
+        if cv_grid_coords[0].ndim == 2:
+            cv_coords = cv_grid_coords[0][:, 0]  # First column has unique x-values
+        else:
+            cv_coords = cv_grid_coords[0]
         xlabel = 'CV 1 (x)'
     else:
         # Project onto y: marginalize over x
+        # Extract 1D coordinate arrays from meshgrid
+        if cv_grid_coords[0].ndim == 2:
+            # Extract 1D x-coords from first column of meshgrid
+            x_coords_1d = cv_grid_coords[0][:, 0]
+        else:
+            x_coords_1d = cv_grid_coords[0]
+        
         exp_neg_energy = np.exp(-energy_grid_2d / kT)  # [nx, ny]
         integral = np.trapz(
-            exp_neg_energy, x=cv_grid_coords[0], axis=0)  # [ny]
+            exp_neg_energy, x=x_coords_1d, axis=0)  # [ny]
         f_projected = -kT * np.log(integral + 1e-10)  # [ny]
-        cv_coords = cv_grid_coords[1]
+        
+        # Extract 1D y-coords from first row of meshgrid
+        if cv_grid_coords[1].ndim == 2:
+            cv_coords = cv_grid_coords[1][0, :]  # First row has unique y-values
+        else:
+            cv_coords = cv_grid_coords[1]
         xlabel = 'CV 2 (y)'
 
     # Shift to have minimum at 0
     f_projected = f_projected - f_projected.min()
 
+    # Ensure cv_coords and f_projected are 1D arrays (flatten if needed)
+    cv_coords = np.asarray(cv_coords).flatten()
+    f_projected = np.asarray(f_projected).flatten()
+
     ax.plot(cv_coords, f_projected, label=label, linewidth=1.5)
     ax.set_xlabel(xlabel, fontsize=fontsize)
     ax.set_ylabel('Free Energy [arb. units]', fontsize=fontsize)
-    ax.set_title(
-        f"1D Projected Energy Profile (projected onto {xlabel})", fontsize=fontsize)
+    # Only set title if it hasn't been set yet (for multi-plot cases)
+    if ax.get_title() == '':
+        ax.set_title(
+            f"1D Projected Energy Profile (projected onto {xlabel})", fontsize=fontsize)
     ax.grid(True, alpha=grid_alpha)
 
-    if label:
-        ax.legend(fontsize=fontsize)
+    # Don't create legend here - let caller handle it for multi-plot cases
+    # if label:
+    #     ax.legend(fontsize=fontsize)
 
     return ax
