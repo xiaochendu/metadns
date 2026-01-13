@@ -896,23 +896,29 @@ def run_sampling(
                     elif args.model_type == "potts":
                         # For Potts, use potts2d_ham
                         raw_energy = potts2d_ham(x, J=args.J, q=args.q)  # [B]
-                        # CV (magnetization-like) - using CV computation function
+                        # For x_up: compute fraction of sites in the most frequent state
+                        # x is [B, L*L] with values in {0, 1, ..., q-1}
+                        x_reshaped = x.reshape(x.shape[0], args.L, args.L)  # [B, L, L]
+                        # For each sample, count occurrences of each state and find max
+                        cv_val = torch.zeros(x.shape[0], device=x.device)
+                        for i in range(x.shape[0]):
+                            sample = x_reshaped[i]  # [L, L]
+                            # Count occurrences of each state
+                            counts = torch.bincount(sample.flatten().long(), minlength=args.q)
+                            # Get the maximum count (most frequent state)
+                            max_count = counts.max().float()
+                            # Fraction of sites in most frequent state
+                            cv_val[i] = max_count / (args.L * args.L)
+                        # Use full CV for bias evaluation (2D projection)
                         cv_val_full = compute_cv_potts(x)  # May be 2D for q=3
-                        # For storage in x_up, use first component or magnitude for 2D CV
-                        if cv_val_full.ndim > 1 and cv_val_full.shape[1] > 1:
-                            # For 2D CV, store the first component for x_up
-                            cv_val = cv_val_full[:, 0] if cv_val_full.shape[1] >= 1 else cv_val_full.squeeze()
-                        else:
-                            cv_val = cv_val_full
-                        # Use full CV for bias evaluation
                         cv_val_for_bias = cv_val_full
                     else:  # ising
                         # For Ising, use ising2d_ham
                         spins = 2 * x.float() - 1
                         raw_energy = ising2d_ham(spins, J=args.J, h=field)
-                        # Magnetization (x_up) - using CV computation function
-                        cv_val = compute_cv_ising(x)
-                        cv_val_for_bias = cv_val  # Same for Ising
+                        # Absolute magnetization (x_up) - using CV computation function
+                        cv_val = torch.abs(compute_cv_ising(x))
+                        cv_val_for_bias = compute_cv_ising(x)  # Use signed magnetization for bias evaluation
                     
                     # Store batch
                     batch_configs.append(x.cpu().numpy())
