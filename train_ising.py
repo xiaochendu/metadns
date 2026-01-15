@@ -77,6 +77,9 @@ parser.add_argument('--use_checkpoint', action='store_true', help='Use gradient 
 parser.add_argument('--scale_bias_with_size', action='store_true', help='Scale bias Delta_T with system size (essential for large L)')
 parser.add_argument('--buffer_size', type=int, default=0, help='Size of experience replay buffer')
 parser.add_argument('--buffer_ratio', type=float, default=0.0, help='Ratio of buffer samples in training batch')
+parser.add_argument('--buffer_n_bins', type=int, default=1, help='Number of bins for CV-based Replay Buffer')
+parser.add_argument('--buffer_strategy', type=str, default='fifo', choices=['fifo', 'balanced'], 
+                    help='Buffer storage strategy: fifo (shared memory) or balanced (partitioned memory)')
 args = parser.parse_args()
 
 if args.use_anneal:
@@ -302,7 +305,8 @@ if not args.use_anneal:
         current_fields=current_fields, rng=rng,
         save_dir=dir_name, cfg_dict=cfg,
         cv_compute_fn=compute_cv_ising,
-        buffer_size=args.buffer_size, buffer_ratio=args.buffer_ratio)
+        buffer_size=args.buffer_size, buffer_ratio=args.buffer_ratio,
+        buffer_n_bins=args.buffer_n_bins, buffer_strategy=args.buffer_strategy)
     
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")
@@ -340,7 +344,9 @@ else:
         ema=ema, losses=losses, ess_train=ess_train, ess_eval=ess_eval,
         wandb_run=wandb_run, L=L, save_dir=dir_name, cfg_dict=cfg,
         buffer_size=args.buffer_size,
-        buffer_ratio=args.buffer_ratio)
+        buffer_ratio=args.buffer_ratio,
+        buffer_n_bins=args.buffer_n_bins,
+        buffer_strategy=args.buffer_strategy)
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")
     save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg, f'{dir_name}/weights_final.pth', bias_pot)

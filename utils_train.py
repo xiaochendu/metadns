@@ -8,7 +8,6 @@ import torch.distributed as dist
 import wandb
 from matplotlib.colors import ListedColormap
 from tqdm import tqdm
-
 from utils import ess, plot_bias_analysis, sample_categorical_logits
 from utils_ising import ising2d_mag
 
@@ -27,10 +26,12 @@ class ReplayBuffer:
     Stores samples (x, beta, h) and allows sampling mixed batches.
     Designed to be stored on CPU to save VRAM, with on-demand move to GPU.
     """
-    def __init__(self, buffer_size, x_shape, device='cpu', dtype=torch.float32):
+    def __init__(self, buffer_size, x_shape, device='cpu', dtype=torch.float32, 
+                 cv_min=None, cv_max=None, n_bins=1, strategy='fifo'):
         self.buffer_size = buffer_size
         self.device = device  # Device where samples are returned (usually GPU)
         self.storage_device = 'cpu' # Store on CPU to save VRAM
+        self.strategy = strategy
         self.ptr = 0
         self.size = 0
         
@@ -39,12 +40,133 @@ class ReplayBuffer:
         self.x = torch.zeros((buffer_size, *x_shape), dtype=torch.long, device=self.storage_device)
         self.beta = torch.zeros(buffer_size, dtype=dtype, device=self.storage_device)
         self.h = torch.zeros(buffer_size, dtype=dtype, device=self.storage_device)
+        self.cv = torch.zeros(buffer_size, dtype=dtype, device=self.storage_device)
         self.has_conditions = False # Track if we are actually storing conditions
+        
+        # CV Binning setup
+        self.n_bins = n_bins
+        self.cv_min = cv_min if cv_min is not None else -1.0
+        self.cv_max = cv_max if cv_max is not None else 1.0
+        # Avoid division by zero if min==max (shouldn't happen but safety first)
+        denom = (self.cv_max - self.cv_min)
+        self.bin_width = denom / n_bins if denom > 1e-6 else 1.0
+        
+        if self.strategy == 'balanced':
+            # Partitioned storage: each bin gets a fixed slice of the buffer
+            self.max_per_bin = buffer_size // n_bins
+            if self.max_per_bin == 0:
+                raise ValueError(f"Buffer size {buffer_size} too small for {n_bins} bins.")
+            
+            # Pointers and counts for each bin
+            self.bin_ptrs = torch.zeros(n_bins, dtype=torch.long, device=self.storage_device)
+            self.bin_counts = torch.zeros(n_bins, dtype=torch.long, device=self.storage_device)
+            self.active_bins = [] # For fast sampling
+            
+            # Warn if buffer_size is not perfectly divisible
+            if buffer_size % n_bins != 0:
+                 print(f"Warning: Buffer size {buffer_size} not divisible by {n_bins}. Using {self.max_per_bin * n_bins} slots.")
+        else:
+            # FIFO strategy (original behavior with bins tracking)
+            # Bin storage: list of lists of indices
+            self.bins = [[] for _ in range(n_bins)]
+            
+            # Index tracking for O(1) removal
+            # sample_bins[i] = which bin sample i is in
+            self.sample_bins = torch.full((buffer_size,), -1, dtype=torch.long, device=self.storage_device)
+            # bin_pos[i] = index of sample i in self.bins[sample_bins[i]]
+            self.bin_pos = torch.full((buffer_size,), -1, dtype=torch.long, device=self.storage_device)
 
-    def add(self, x, beta=None, h=None):
+    def add(self, x, beta=None, h=None, cv=None):
         """Add a batch of samples to the buffer."""
         # Clean inputs and move to storage device
         x = x.to(self.storage_device)
+        
+        if self.strategy == 'balanced':
+            self._add_balanced(x, beta, h, cv)
+        else:
+            self._add_fifo(x, beta, h, cv)
+            
+    def _add_balanced(self, x, beta, h, cv):
+        if cv is None:
+             # If balanced mode but no CV, dump to bin 0 (fallback)
+             cv = torch.full((x.shape[0],), self.cv_min, device=self.storage_device)
+        else:
+             cv = cv.to(self.storage_device)
+             
+        # Compute bins for input samples
+        bin_indices = ((cv - self.cv_min) / self.bin_width).floor().long()
+        bin_indices = bin_indices.clamp(0, self.n_bins - 1)
+        
+        # We process each bin separately to allow vectorization within bins
+        # This is reasonably fast because n_bins is small (approx 10-100)
+        unique_bins = torch.unique(bin_indices)
+        
+        for b in unique_bins:
+            # Mask for current bin
+            mask = (bin_indices == b)
+            
+            # Extract samples for this bin
+            x_b = x[mask]
+            
+            n_samples = x_b.shape[0]
+            
+            # If input samples exceed bin capacity, keep only the latest ones
+            # (User feedback: "only take the final n samples")
+            if n_samples > self.max_per_bin:
+                x_b = x_b[-self.max_per_bin:]
+                # Also update beta/h/cv slices if needed (done below lazily via indices)
+                # But here we need to slice the mask or indices to match
+                # Easiest way: re-slice mask? No, mask is for input batch.
+                # Let's just update n_samples and handle slicing carefully.
+                start_idx_in_batch = n_samples - self.max_per_bin # Logic is getting complex for batch slicing
+                # Simplify: Slice everything now
+                mask_indices = torch.nonzero(mask).squeeze(-1)
+                # Take last N indices
+                selected_indices = mask_indices[-self.max_per_bin:]
+                n_samples = self.max_per_bin
+                x_b = x[selected_indices]
+                # Beta/H/CV for this bin
+                mask = torch.zeros_like(mask) # Reset mask
+                mask[selected_indices] = True
+            
+            # Calculate destination indices in global buffer
+            # Global index = b * max_per_bin + local_offset
+            # We use circular buffer logic within the bin
+            
+            start_ptr = self.bin_ptrs[b].item()
+            indices = torch.arange(start_ptr, start_ptr + n_samples, device=self.storage_device) % self.max_per_bin
+            global_indices = b * self.max_per_bin + indices
+            
+            # Write to buffer
+            self.x[global_indices] = x_b
+            self.cv[global_indices] = cv[mask]
+            
+            if beta is not None:
+                self.has_conditions = True
+                if isinstance(beta, torch.Tensor):
+                    beta_in = beta.to(self.storage_device)
+                    if beta_in.ndim == 0: beta_in = beta_in.expand(x.shape[0])
+                    self.beta[global_indices] = beta_in[mask]
+                else:
+                    self.beta[global_indices] = torch.full((n_samples,), beta, device=self.storage_device)
+            
+            if h is not None:
+                self.has_conditions = True
+                if isinstance(h, torch.Tensor):
+                    h_in = h.to(self.storage_device)
+                    if h_in.ndim == 0: h_in = h_in.expand(x.shape[0])
+                    self.h[global_indices] = h_in[mask]
+                else:
+                    self.h[global_indices] = torch.full((n_samples,), h, device=self.storage_device)
+            
+            # Update pointers
+            self.bin_ptrs[b] = (start_ptr + n_samples) % self.max_per_bin
+            self.bin_counts[b] = min(self.bin_counts[b].item() + n_samples, self.max_per_bin)
+            
+        # Update total size (sum of all bin counts)
+        self.size = self.bin_counts.sum().item()
+        
+    def _add_fifo(self, x, beta, h, cv):
         batch_size = x.shape[0]
         
         if batch_size > self.buffer_size:
@@ -52,12 +174,67 @@ class ReplayBuffer:
             x = x[-self.buffer_size:]
             if beta is not None: beta = beta[-self.buffer_size:]
             if h is not None: h = h[-self.buffer_size:]
+            if cv is not None: cv = cv[-self.buffer_size:]
             batch_size = x.shape[0]
             
         # Indices for circular buffer
         indices = torch.arange(self.ptr, self.ptr + batch_size) % self.buffer_size
         
+        # Remove overwritten samples from their bins
+        # We need to do this element-wise or careful batching because list implementation
+        # For Python speed, a loop is acceptable for typical batch sizes (e.g. 128)
+        # Vectorized approach is hard because multiple removed items might be in same bin
+        
+        indices_np = indices.numpy() # CPU
+        sample_bins_np = self.sample_bins.numpy()
+        bin_pos_np = self.bin_pos.numpy()
+        
+        for idx in indices_np:
+            if self.size == self.buffer_size: # Logic only needed if we are overwriting
+                old_bin = sample_bins_np[idx]
+                if old_bin != -1: # Should be true if buffer full
+                    pos = bin_pos_np[idx]
+                    bin_list = self.bins[old_bin]
+                    
+                    # Swap with last element and pop
+                    last_element_idx = bin_list[-1]
+                    
+                    if last_element_idx != idx:
+                         bin_list[pos] = last_element_idx
+                         bin_pos_np[last_element_idx] = pos # Update swapped element's pos
+                         
+                    bin_list.pop()
+                    # No need to update bin_pos_np[idx] as it will be overwritten below
+
         self.x[indices] = x
+        
+        if cv is not None:
+             cv_in = cv.to(self.storage_device)
+             self.cv[indices] = cv_in
+             # Compute new bins
+             # bin = floor((cv - min) / width)
+             # clamp to [0, n_bins-1]
+             bin_indices = ((cv_in - self.cv_min) / self.bin_width).floor().long()
+             bin_indices = bin_indices.clamp(0, self.n_bins - 1)
+        else:
+             # Default to bin 0 if no CV provided (or uniform random? No, better 0)
+             # Only happens if user forgets to pass CV.
+             bin_indices = torch.zeros(batch_size, dtype=torch.long, device=self.storage_device)
+             
+        bin_indices_np = bin_indices.numpy()
+        
+        # Add new samples to bins
+        for i, idx in enumerate(indices_np):
+            new_bin = bin_indices_np[i]
+            
+            self.bins[new_bin].append(idx)
+            
+            # Update tracking
+            sample_bins_np[idx] = new_bin
+            bin_pos_np[idx] = len(self.bins[new_bin]) - 1
+
+        # Sync back numpy views to tensors (share memory usually but good to be safe)
+        # (Tensor.numpy() shares memory for CPU tensors, so modifications are in-place)
         
         if beta is not None:
             self.has_conditions = True
@@ -87,7 +264,58 @@ class ReplayBuffer:
         if self.size == 0:
             return None, None, None
             
-        indices = torch.randint(0, self.size, (batch_size,))
+        if self.strategy == 'balanced':
+            # 1. Identify non-empty bins from counts
+            non_empty_bins = torch.nonzero(self.bin_counts > 0).squeeze(-1) # [N_active]
+            
+            if non_empty_bins.numel() == 0:
+                return None, None, None
+                
+            # 2. Sample bins uniformly (with replacement)
+            # Use torch for random choice
+            random_indices = torch.randint(0, non_empty_bins.numel(), (batch_size,), device=self.storage_device)
+            chosen_bins = non_empty_bins[random_indices] # [B]
+            
+            # 3. For each chosen bin, sample uniform index within its count
+            # Get counts for chosen bins
+            chosen_counts = self.bin_counts[chosen_bins]
+            
+            # Draw random offset for each sample: 0 to count-1
+            offsets = (torch.rand(batch_size, device=self.storage_device) * chosen_counts).long()
+            
+            # Global index = bin * max + offset
+            # Note: We don't worry about circular pointer 'start' here because relevant data is always 0..count-1?
+            # Wait! In 'add', we write circularly to bin range.
+            # BUT we don't zero out old data. 
+            # If count < max, data is at [0, count-1].
+            # If count == max, data is at [0, max-1] (full).
+            # So picking any index 0..count-1 is valid. The 'start_ptr' is just for writing.
+            indices = chosen_bins * self.max_per_bin + offsets
+            
+        else: # FIFO
+            # CV-based Sampling:
+            # 1. Identify non-empty bins
+            non_empty_bins = [i for i, b in enumerate(self.bins) if len(b) > 0]
+            if not non_empty_bins:
+                 return None, None, None
+                 
+            # 2. Sample bins uniformly
+            # samples_per_bin = batch_size // len(non_empty_bins) 
+            # (This approach might be tricky if batch_size is small or bins are many. 
+            #  Better to just sample batch_size bin indices uniformly with replacement)
+            
+            chosen_bins = np.random.choice(non_empty_bins, size=batch_size, replace=True)
+            
+            indices = torch.empty(batch_size, dtype=torch.long, device=self.storage_device)
+            
+            # 3. For each chosen bin, sample a random element from it
+            # Optimization: group by bin to avoid calling random choice too many times? 
+            # Actually random choice from list is fast.
+            
+            for i, bin_idx in enumerate(chosen_bins):
+                 bin_list = self.bins[bin_idx]
+                 rand_pos = np.random.randint(0, len(bin_list))
+                 indices[i] = bin_list[rand_pos]
         
         x_out = self.x[indices].to(self.device)
         
@@ -97,6 +325,8 @@ class ReplayBuffer:
         else:
             beta_out = None
             h_out = None
+            
+        return x_out, beta_out, h_out
             
         return x_out, beta_out, h_out
 
@@ -615,7 +845,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
           losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None, 
           bias_potential=None, current_fields=None, rng=None, save_dir=None, cfg_dict=None,
           validation_plot_callback=None, cv_compute_fn=None,
-          buffer_size=0, buffer_ratio=0.0, plot_bias_fn=None):
+          buffer_size=0, buffer_ratio=0.0, buffer_n_bins=1, buffer_strategy='fifo', plot_bias_fn=None):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
                'wdce': loss_wdce}.get(args.loss_fn)
     if loss_fn is None:
@@ -634,8 +864,12 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
     if buffer_size > 0:
         # Determine dimension D from model
         D = model.length
-        replay_buffer = ReplayBuffer(buffer_size, (D,), device=device)
-        print(f"Initialized ReplayBuffer with size {buffer_size} and mixing ratio {buffer_ratio}")
+        cv_min_val = args.cv_min if hasattr(args, 'cv_min') else -1.0
+        cv_max_val = args.cv_max if hasattr(args, 'cv_max') else 1.0
+        
+        replay_buffer = ReplayBuffer(buffer_size, (D,), device=device,
+                                     cv_min=cv_min_val, cv_max=cv_max_val, n_bins=buffer_n_bins, strategy=buffer_strategy)
+        print(f"Initialized ReplayBuffer with size {buffer_size}, mixing ratio {buffer_ratio}, n_bins {buffer_n_bins}, strategy {buffer_strategy}")
 
     # Handle multiple temperatures/fields
     from utils_ising import get_temp_field_batch, sample_temp_field
@@ -743,26 +977,25 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
         # Update bias after sampling (on-policy update)
         # CRITICAL FIX: Only update bias if we actually generated new samples!
         # Otherwise we build a huge wall at the same spot for N steps (sloshing).
-        if bias_potential is not None and is_fresh_sample:
-            # Calculate CV (Magnetization for Ising, Concentration for CuAu, etc.)
-            with torch.no_grad():
+        
+        # Calculate CV if needed (for bias or buffer)
+        s_cv = None
+        if is_fresh_sample and (bias_potential is not None or replay_buffer is not None):
+             with torch.no_grad():
                 if cv_compute_fn is not None:
-                    s = cv_compute_fn(x)  # Use provided CV computation function
+                    s_cv = cv_compute_fn(x)  # Use provided CV computation function
                 else:
                     # Backward compatible: default to Ising magnetization
-                    # x is [B, D] in {0, 1} usually? 
-                    # utils_ising functions usually expect {-1, 1} but handle it?
-                    # train_ising.py reward_fn converts 0/1 to -1/1.
-                    # ising2d_mag inside utils_ising expects {-1, 1}
-                    # rnd returns x in {0..(vocab-1)}. For Ising vocab=2 (0, 1).
-                    # So we must convert to spins for ising2d_mag: 2*x - 1
                     x_spins = 2 * x - 1
-                    s = ising2d_mag(x_spins)
-                bias_potential.update(s)
+                    s_cv = ising2d_mag(x_spins)
+        
+        if bias_potential is not None and is_fresh_sample:
+             if s_cv is not None:
+                bias_potential.update(s_cv)
 
         # Add to Replay Buffer - ONLY FRESH SAMPLES
         if replay_buffer is not None and is_fresh_sample:
-            replay_buffer.add(x, beta=beta_batch, h=h_batch)
+            replay_buffer.add(x, beta=beta_batch, h=h_batch, cv=s_cv)
             
         # Prepare Training Batch (Mix Fresh + Replay)
         x_train, log_rnd_train = x, log_rnd
