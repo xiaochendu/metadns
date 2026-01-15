@@ -363,7 +363,15 @@ def ising_2pt_corr_direction(S, r_x, r_y, use_x = True, use_y = True):
         S = torch.from_numpy(S)
     
     assert torch.all((S == 1) | (S == -1)), "All entries of S must be either 1 or -1"
-    S = S.reshape(-1, 16, 16)
+    
+    # Auto-detect grid size L from input shape
+    # Input shape is (B, L*L), so L = sqrt(n_sites)
+    n_sites = S.shape[-1]
+    L = int(np.sqrt(n_sites))
+    assert L * L == n_sites, f"Number of sites ({n_sites}) must be a perfect square (got L={L}, L*L={L*L})"
+    
+    # Reshape to (B, L, L) instead of hardcoded (B, 16, 16)
+    S = S.reshape(-1, L, L)
     
     if use_x:
         S_neighbor = 1/2 * (torch.roll(S, shifts=-r_x, dims=1) + torch.roll(S, shifts=r_x, dims=1))
@@ -388,7 +396,15 @@ def ising2d_mag_direction(S, use_row = True, use_col = False):
     if not isinstance(S, torch.Tensor):
         S = torch.from_numpy(S)
     assert torch.all((S == 1) | (S == -1)), "All entries of S must be either 1 or -1"
-    S = S.view(S.size(0), 16, 16)
+    
+    # Auto-detect grid size L from input shape
+    # Input shape is (B, L*L), so L = sqrt(n_sites)
+    n_sites = S.shape[-1]
+    L = int(np.sqrt(n_sites))
+    assert L * L == n_sites, f"Number of sites ({n_sites}) must be a perfect square (got L={L}, L*L={L*L})"
+    
+    # Reshape to (B, L, L) instead of hardcoded (B, 16, 16)
+    S = S.view(S.size(0), L, L)
     
     if use_row:
         return S.float().mean(dim=1).mean(dim = 0)

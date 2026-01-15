@@ -624,16 +624,17 @@ def plot_1d_projected_energy(energy_grid_2d, cv_grid_coords,
             y_coords_1d = cv_grid_coords[1][0, :]
         else:
             y_coords_1d = cv_grid_coords[1]
-        
+
         exp_neg_energy = np.exp(-energy_grid_2d / kT)  # [nx, ny]
         integral = np.trapz(
             exp_neg_energy, x=y_coords_1d, axis=1)  # [nx]
         # [nx] (add small epsilon for numerical stability)
         f_projected = -kT * np.log(integral + 1e-10)
-        
+
         # Extract 1D x-coords from first column of meshgrid
         if cv_grid_coords[0].ndim == 2:
-            cv_coords = cv_grid_coords[0][:, 0]  # First column has unique x-values
+            # First column has unique x-values
+            cv_coords = cv_grid_coords[0][:, 0]
         else:
             cv_coords = cv_grid_coords[0]
         xlabel = 'CV 1 (x)'
@@ -645,15 +646,16 @@ def plot_1d_projected_energy(energy_grid_2d, cv_grid_coords,
             x_coords_1d = cv_grid_coords[0][:, 0]
         else:
             x_coords_1d = cv_grid_coords[0]
-        
+
         exp_neg_energy = np.exp(-energy_grid_2d / kT)  # [nx, ny]
         integral = np.trapz(
             exp_neg_energy, x=x_coords_1d, axis=0)  # [ny]
         f_projected = -kT * np.log(integral + 1e-10)  # [ny]
-        
+
         # Extract 1D y-coords from first row of meshgrid
         if cv_grid_coords[1].ndim == 2:
-            cv_coords = cv_grid_coords[1][0, :]  # First row has unique y-values
+            # First row has unique y-values
+            cv_coords = cv_grid_coords[1][0, :]
         else:
             cv_coords = cv_grid_coords[1]
         xlabel = 'CV 2 (y)'

@@ -13,6 +13,7 @@ dependencies:
   - tqdm
   - einops
   - huggingface_hub
+  - hydra-core
   - omegaconf
   - pyyaml
   - pip
