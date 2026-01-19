@@ -14,10 +14,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import utils_train
 import wandb
 from ase import Atoms
-
-import utils_train
 from bias import BiasPotential
 from energy_cuau import AuCuAlloyModel
 from model import ExponentialMovingAverage
@@ -245,6 +244,9 @@ def get_args():
     # Replay Buffer
     parser.add_argument("--buffer_size", type=int, default=0, help="Size of experience replay buffer")
     parser.add_argument("--buffer_ratio", type=float, default=0.0, help="Ratio of buffer samples in training batch")
+    parser.add_argument("--buffer_n_bins", type=int, default=1, help="Number of bins for CV-based Replay Buffer")
+    parser.add_argument("--buffer_strategy", type=str, default="fifo", choices=["fifo", "balanced"], 
+                        help="Buffer storage strategy: fifo or balanced")
     
     # Logging
     parser.add_argument("--out_dir", type=str, default="results/cuau")
@@ -504,6 +506,8 @@ def main():
         cv_compute_fn=compute_cv_cuau,
         buffer_size=args.buffer_size,
         buffer_ratio=args.buffer_ratio,
+        buffer_n_bins=args.buffer_n_bins,
+        buffer_strategy=args.buffer_strategy,
     )
 
 if __name__ == "__main__":

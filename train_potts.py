@@ -2,7 +2,6 @@ from warnings import simplefilter
 
 import matplotlib.pyplot as plt
 import torch
-
 from model import ExponentialMovingAverage, get_rope_vit_model
 from utils import Dict2Obj, plot_bias_analysis_2d, plot_loss_ess
 from utils_potts import potts2d_ham, potts2d_magnetization_all
@@ -18,7 +17,6 @@ from pprint import pformat
 
 import numpy as np
 import wandb
-
 from bias import BiasPotential, BiasPotentialMultiDim
 
 parser = argparse.ArgumentParser()
@@ -52,6 +50,9 @@ parser.add_argument('--scale_bias_with_size', action='store_true', help='Scale b
 parser.add_argument('--no_normalize_bias_by_batch', dest='normalize_bias_by_batch', action='store_false', default=True, help="Disable bias height norm by batch size")
 parser.add_argument('--buffer_size', type=int, default=0, help='Replay buffer size')
 parser.add_argument('--buffer_ratio', type=float, default=0.0, help='Ratio of buffer samples in batch')
+parser.add_argument('--buffer_n_bins', type=int, default=1, help='Number of bins for CV-based Replay Buffer')
+parser.add_argument('--buffer_strategy', type=str, default='fifo', choices=['fifo', 'balanced'], 
+                    help='Buffer storage strategy: fifo or balanced')
 parser.add_argument('--wandb', dest='use_wandb', action='store_true', help="Enable wandb logging")
 parser.add_argument('--no-wandb', dest='use_wandb', action='store_false', help="Disable wandb logging")
 parser.set_defaults(use_wandb=False)
@@ -329,6 +330,7 @@ if not args.use_anneal:
         losses=losses, ess_train=ess_train, ess_eval=ess_eval,
         wandb_run=wandb_run, L=L, bias_potential=bias_pot, cv_compute_fn=compute_cv_potts,
         buffer_size=args.buffer_size, buffer_ratio=args.buffer_ratio,
+        buffer_n_bins=args.buffer_n_bins, buffer_strategy=args.buffer_strategy,
         save_dir=dir_name, cfg_dict=cfg,
         plot_bias_fn=plot_bias_analysis_2d) # Pass 2D plot function
     
@@ -364,7 +366,9 @@ else:
         model, optimizer, reward_fn_main, 
         Dict2Obj(cfg), device, num_epochs=args.num_epochs, 
         ema=ema, losses=losses, ess_train=ess_train, ess_eval=ess_eval,
-        wandb_run=wandb_run, L=L, save_dir=dir_name, cfg_dict=cfg)
+        wandb_run=wandb_run, L=L, save_dir=dir_name, cfg_dict=cfg,
+        buffer_size=args.buffer_size, buffer_ratio=args.buffer_ratio,
+        buffer_n_bins=args.buffer_n_bins, buffer_strategy=args.buffer_strategy)
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")
     torch.save({
