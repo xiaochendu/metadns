@@ -3,6 +3,7 @@ from warnings import simplefilter
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
 from model import ExponentialMovingAverage, get_rope_vit_model
 from utils import Dict2Obj, plot_loss_ess
 from utils_ising import ising2d_ham, ising2d_mag, reward_fn_ising
@@ -16,6 +17,7 @@ from pathlib import Path
 from pprint import pformat
 
 import wandb
+
 from bias import BiasPotential
 from utils_ising import ising2d_mag
 
@@ -146,11 +148,16 @@ cfg = {'tokens': 2,
        'bias_factor': args.bias_factor,
        'bias_grid_size': args.bias_grid_size,
        'kernel_type': args.kernel_type,
+       'cv_min': args.cv_min,
+       'cv_max': args.cv_max,
        'save_every': args.save_every,
        'J': J,
        'scale_bias_with_size': args.scale_bias_with_size,
        'buffer_size': args.buffer_size,
-       'buffer_ratio': args.buffer_ratio}
+       'buffer_ratio': args.buffer_ratio,
+       'buffer_n_bins': args.buffer_n_bins,
+       'buffer_strategy': args.buffer_strategy
+       }
 
 # Check batch size compatibility if using multiple temps/fields
 if len(temps) > 1 or len(fields) > 1:
@@ -170,12 +177,36 @@ if len(temps) > 1 or len(fields) > 1:
 
 wandb_run = None
 if args.use_wandb:
-    wandb_run = wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_run_name or args.dir_name,
-        dir=str(dir_name),
-        config=cfg,
-    )
+    # Check for wandb run ID in environment variable (set by resume_training.py)
+    wandb_run_id = os.environ.get("WANDB_RUN_ID", None)
+    wandb_resume = os.environ.get("WANDB_RESUME", "never")
+    
+    # Calculate start_epoch from checkpoint if resuming (needed for wandb step)
+    wandb_start_step = None
+    if wandb_run_id and resume_path is not None:
+        try:
+            checkpoint = torch.load(resume_path, map_location='cpu')
+            losses = checkpoint.get('losses', [])
+            wandb_start_step = len(losses) if losses else 0
+        except Exception as e:
+            print(f"Warning: Could not determine start step from checkpoint: {e}")
+    
+    wandb_init_kwargs = {
+        "project": args.wandb_project,
+        "name": args.wandb_run_name or args.dir_name,
+        "dir": str(dir_name),
+        "config": cfg,
+    }
+    
+    # If resuming, add id and resume parameters
+    if wandb_run_id:
+        wandb_init_kwargs["id"] = wandb_run_id
+        wandb_init_kwargs["resume"] = wandb_resume
+        print(f"Resuming wandb run with ID: {wandb_run_id}")
+        if wandb_start_step is not None:
+            print(f"Note: All logging will use step numbers starting from {wandb_start_step}")
+    
+    wandb_run = wandb.init(**wandb_init_kwargs)
 
 model = get_rope_vit_model(L, embed_dim=cfg['model']['hidden_size'], 
                           depth=cfg['model']['n_blocks'], 
@@ -194,6 +225,7 @@ with open(dir_name / 'config.json', 'w') as f:
     json.dump(cfg, f, indent=4)
 
 if not args.use_anneal:
+    start_epoch = 0
     if resume_path is not None:
         print("Loading checkpoint from: ", resume_path)
         checkpoint = torch.load(resume_path, map_location=device)
@@ -208,6 +240,12 @@ if not args.use_anneal:
         current_fields = checkpoint.get('current_fields', None)
         rng = checkpoint.get('rng', None)
         bias_state = checkpoint.get('bias_potential', None)
+        buffer_state = checkpoint.get('replay_buffer', None)
+        # Calculate starting epoch from checkpoint
+        start_epoch = len(losses) if losses else 0
+        print(f"Resuming from epoch {start_epoch}")
+        if buffer_state is not None:
+            print("Found replay buffer state in checkpoint (will load after buffer initialization)")
     else:
         print("No checkpoint provided, starting from scratch")
         losses = []
@@ -306,7 +344,9 @@ if not args.use_anneal:
         save_dir=dir_name, cfg_dict=cfg,
         cv_compute_fn=compute_cv_ising,
         buffer_size=args.buffer_size, buffer_ratio=args.buffer_ratio,
-        buffer_n_bins=args.buffer_n_bins, buffer_strategy=args.buffer_strategy)
+        buffer_n_bins=args.buffer_n_bins, buffer_strategy=args.buffer_strategy,
+        buffer_state_dict=buffer_state,
+        start_epoch=start_epoch)
     
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")

@@ -8,6 +8,7 @@ import torch.distributed as dist
 import wandb
 from matplotlib.colors import ListedColormap
 from tqdm import tqdm
+
 from utils import ess, plot_bias_analysis, sample_categorical_logits
 from utils_ising import ising2d_mag
 
@@ -327,8 +328,127 @@ class ReplayBuffer:
             h_out = None
             
         return x_out, beta_out, h_out
+    
+    def state_dict(self):
+        """Return state dict for checkpointing."""
+        state = {
+            # Configuration
+            'buffer_size': self.buffer_size,
+            'x_shape': tuple(self.x.shape[1:]),  # Exclude batch dimension
+            'device': self.device,
+            'storage_device': self.storage_device,
+            'dtype': self.beta.dtype,  # Use beta to get dtype
+            'strategy': self.strategy,
+            'n_bins': self.n_bins,
+            'cv_min': self.cv_min,
+            'cv_max': self.cv_max,
+            'bin_width': self.bin_width,
             
-        return x_out, beta_out, h_out
+            # State variables
+            'ptr': self.ptr,
+            'size': self.size,
+            'has_conditions': self.has_conditions,
+            
+            # Data tensors
+            'x': self.x.clone(),
+            'beta': self.beta.clone(),
+            'h': self.h.clone(),
+            'cv': self.cv.clone(),
+        }
+        
+        # Strategy-specific state
+        if self.strategy == 'balanced':
+            state['max_per_bin'] = self.max_per_bin
+            state['bin_ptrs'] = self.bin_ptrs.clone()
+            state['bin_counts'] = self.bin_counts.clone()
+            # Convert active_bins list to tensor for serialization
+            if self.active_bins:
+                state['active_bins'] = torch.tensor(self.active_bins, dtype=torch.long)
+            else:
+                state['active_bins'] = torch.tensor([], dtype=torch.long)
+        else:  # FIFO
+            # Convert bins (list of lists) to a format that can be serialized
+            # Store as a list of tensors
+            state['bins'] = [torch.tensor(bin_list, dtype=torch.long) for bin_list in self.bins]
+            state['sample_bins'] = self.sample_bins.clone()
+            state['bin_pos'] = self.bin_pos.clone()
+        
+        return state
+    
+    def load_state_dict(self, state_dict):
+        """Load state dict from checkpoint.
+        
+        Args:
+            state_dict: Dictionary containing buffer state. If None or missing keys,
+                       will gracefully skip loading (for backward compatibility).
+        """
+        if state_dict is None:
+            return  # Backward compatibility: skip if None
+        
+        # Load configuration and verify compatibility
+        if 'buffer_size' in state_dict:
+            if state_dict['buffer_size'] != self.buffer_size:
+                raise ValueError(f"Buffer size mismatch: checkpoint has {state_dict['buffer_size']}, "
+                               f"but current buffer has {self.buffer_size}")
+        
+        if 'x_shape' in state_dict:
+            if state_dict['x_shape'] != tuple(self.x.shape[1:]):
+                raise ValueError(f"x_shape mismatch: checkpoint has {state_dict['x_shape']}, "
+                               f"but current buffer has {tuple(self.x.shape[1:])}")
+        
+        if 'strategy' in state_dict:
+            if state_dict['strategy'] != self.strategy:
+                raise ValueError(f"Strategy mismatch: checkpoint has {state_dict['strategy']}, "
+                               f"but current buffer has {self.strategy}")
+        
+        if 'n_bins' in state_dict:
+            if state_dict['n_bins'] != self.n_bins:
+                raise ValueError(f"n_bins mismatch: checkpoint has {state_dict['n_bins']}, "
+                               f"but current buffer has {self.n_bins}")
+        
+        # Load state variables
+        if 'ptr' in state_dict:
+            self.ptr = state_dict['ptr']
+        if 'size' in state_dict:
+            self.size = state_dict['size']
+        if 'has_conditions' in state_dict:
+            self.has_conditions = state_dict['has_conditions']
+        
+        # Load data tensors (only if they exist in checkpoint)
+        if 'x' in state_dict:
+            self.x.copy_(state_dict['x'])
+        if 'beta' in state_dict:
+            self.beta.copy_(state_dict['beta'])
+        if 'h' in state_dict:
+            self.h.copy_(state_dict['h'])
+        if 'cv' in state_dict:
+            self.cv.copy_(state_dict['cv'])
+        
+        # Load strategy-specific state
+        if self.strategy == 'balanced':
+            if 'bin_ptrs' in state_dict:
+                self.bin_ptrs.copy_(state_dict['bin_ptrs'])
+            if 'bin_counts' in state_dict:
+                self.bin_counts.copy_(state_dict['bin_counts'])
+            if 'active_bins' in state_dict:
+                # Convert tensor back to list
+                active_bins_tensor = state_dict['active_bins']
+                if active_bins_tensor.numel() > 0:
+                    self.active_bins = active_bins_tensor.tolist()
+                else:
+                    self.active_bins = []
+        else:  # FIFO
+            if 'bins' in state_dict:
+                # Convert list of tensors back to list of lists
+                bins_tensors = state_dict['bins']
+                if len(bins_tensors) != self.n_bins:
+                    raise ValueError(f"Number of bins mismatch: checkpoint has {len(bins_tensors)}, "
+                                   f"but current buffer has {self.n_bins}")
+                self.bins = [tensor.tolist() for tensor in bins_tensors]
+            if 'sample_bins' in state_dict:
+                self.sample_bins.copy_(state_dict['sample_bins'])
+            if 'bin_pos' in state_dict:
+                self.bin_pos.copy_(state_dict['bin_pos'])
 
 
 def compute_model_log_prob(model, x, beta=None, h=None):
@@ -393,7 +513,7 @@ def compute_model_log_prob(model, x, beta=None, h=None):
     return log_rnd_term
 
 
-def save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg, path, bias_potential=None):
+def save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg, path, bias_potential=None, replay_buffer=None):
     """Helper function to save model checkpoint."""
     torch.save({
         'model_state_dict': model.state_dict(),
@@ -403,6 +523,7 @@ def save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg, pat
         'ess_train': ess_train,
         'ess_eval': ess_eval,
         'bias_potential': bias_potential.state_dict() if bias_potential is not None else None,
+        'replay_buffer': replay_buffer.state_dict() if replay_buffer is not None else None,
         'cfg': cfg
     }, path)
 
@@ -845,7 +966,8 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
           losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None, 
           bias_potential=None, current_fields=None, rng=None, save_dir=None, cfg_dict=None,
           validation_plot_callback=None, cv_compute_fn=None,
-          buffer_size=0, buffer_ratio=0.0, buffer_n_bins=1, buffer_strategy='fifo', plot_bias_fn=None):
+          buffer_size=0, buffer_ratio=0.0, buffer_n_bins=1, buffer_strategy='fifo', plot_bias_fn=None,
+          buffer_state_dict=None, start_epoch=0):
     loss_fn = {'ce': loss_ce, 'lv': loss_lv, 're_rf': loss_re_rf,
                'wdce': loss_wdce}.get(args.loss_fn)
     if loss_fn is None:
@@ -855,7 +977,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
     losses = [] if losses is None else losses.copy()
     ess_train = [] if ess_train is None else ess_train.copy()
     ess_eval = [] if ess_eval is None else ess_eval.copy()
-    pbar = tqdm(range(num_epochs))
+    pbar = tqdm(range(num_epochs), initial=start_epoch, total=start_epoch+num_epochs)
     if args.seed is not None:
         torch.manual_seed(args.seed); np.random.seed(args.seed); random.seed(args.seed)
 
@@ -870,6 +992,15 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
         replay_buffer = ReplayBuffer(buffer_size, (D,), device=device,
                                      cv_min=cv_min_val, cv_max=cv_max_val, n_bins=buffer_n_bins, strategy=buffer_strategy)
         print(f"Initialized ReplayBuffer with size {buffer_size}, mixing ratio {buffer_ratio}, n_bins {buffer_n_bins}, strategy {buffer_strategy}")
+        
+        # Load buffer state from checkpoint if provided
+        if buffer_state_dict is not None:
+            try:
+                replay_buffer.load_state_dict(buffer_state_dict)
+                print(f"Loaded ReplayBuffer state from checkpoint (size={replay_buffer.size})")
+            except Exception as e:
+                print(f"Warning: Could not load ReplayBuffer state from checkpoint: {e}")
+                print("Continuing with empty buffer.")
 
     # Handle multiple temperatures/fields
     from utils_ising import get_temp_field_batch, sample_temp_field
@@ -1120,7 +1251,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                     # Silently skip visualization if there's an error
                     pass
             
-            wandb_run.log(log_dict, step=epoch)
+            wandb_run.log(log_dict, step=start_epoch + epoch)
         
         loss.backward()
         if args.grad_clip:
@@ -1131,9 +1262,9 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
         pbar.set_postfix(loss=info['loss'], ess=info['ess_train'])
 
         # Save checkpoint periodically
-        if save_dir is not None and getattr(args, 'save_every', 0) > 0 and (epoch + 1) % args.save_every == 0:
-            save_path = f"{save_dir}/ckpt_{epoch+1}.pth"
-            save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg_dict, save_path, bias_potential)
+        if save_dir is not None and getattr(args, 'save_every', 0) > 0 and (start_epoch + epoch + 1) % args.save_every == 0:
+            save_path = f"{save_dir}/ckpt_{start_epoch + epoch + 1}.pth"
+            save_checkpoint(model, optimizer, ema, losses, ess_train, ess_eval, cfg_dict, save_path, bias_potential, replay_buffer)
         
         # Evaluate periodically
         if epoch % args.eval_every == 0:
@@ -1172,11 +1303,11 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                         beta_batch=eval_beta_batch,
                         h_batch=eval_h_batch,
                         log_rnd=log_rnd,
-                        step=epoch,
+                        step=start_epoch + epoch,
                     )
                     
                     # Also log ESS (log_rnd stats are included in log_validation_metrics)
-                    wandb_run.log({"val/ess": eval_ess}, step=epoch)
+                    wandb_run.log({"val/ess": eval_ess}, step=start_epoch + epoch)
                     
                     # Call validation plotting callback if provided
                     if validation_plot_callback is not None:
@@ -1205,7 +1336,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                                 temps=plot_temps,
                                 fields=plot_fields,
                                 wandb_run=wandb_run,
-                                step=epoch,
+                                step=start_epoch + epoch,
                             )
                         except Exception as e:
                             logging.warning(f"Validation plotting callback failed: {e}")
@@ -1217,7 +1348,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                             q = cfg_dict.get('q', None) if cfg_dict is not None else None
                             fig = _visualize_lattices(x, L, n_rows=2, n_cols=5, max_samples=10,
                                                       beta_batch=eval_beta_batch, h_batch=eval_h_batch, q=q)
-                            wandb_run.log({"val/samples": wandb.Image(fig)}, step=epoch)
+                            wandb_run.log({"val/samples": wandb.Image(fig)}, step=start_epoch + epoch)
                             plt.close(fig)
                         except Exception as e:
                             # Silently skip visualization if there's an error
@@ -1269,7 +1400,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                                                           biased_reward=biased_reward_vals, 
                                                           s_buffer=s_buffer)
                             if fig_bias is not None:
-                                wandb_run.log({"val/bias_analysis_plot": wandb.Image(fig_bias)}, step=epoch)
+                                wandb_run.log({"val/bias_analysis_plot": wandb.Image(fig_bias)}, step=start_epoch + epoch)
                                 plt.close(fig_bias)
                         except Exception as e:
                             print(f"Error plotting bias analysis during val: {e}")
