@@ -1286,14 +1286,15 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                                  J=args.J if hasattr(args, 'J') else 1)
                 eval_ess = ess(log_rnd)
                 ess_eval.append(eval_ess)
+                # Evaluate metrics (always compute, log if wandb enabled)
+                logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model,
+                                                               beta_batch=eval_beta_batch, h_batch=eval_h_batch,
+                                                               J=args.J if hasattr(args, 'J') else 1,
+                                                               bias_potential=bias_potential,
+                                                               cv_compute_fn=cv_compute_fn)
+                vfe = logp_x_vals - logf_t_vals  # variational free energy
+                
                 if wandb_run is not None:
-                    logf_t_vals, logp_x_vals = _compute_log_stats(x, log_rnd, reward_fn, model,
-                                                                   beta_batch=eval_beta_batch, h_batch=eval_h_batch,
-                                                                   J=args.J if hasattr(args, 'J') else 1,
-                                                                   bias_potential=bias_potential,
-                                                                   cv_compute_fn=cv_compute_fn)
-                    vfe = logp_x_vals - logf_t_vals  # variational free energy
-                    
                     # Use the new per-condition logging function (similar to snowyflow)
                     log_validation_metrics(
                         wandb_run=wandb_run,
@@ -1308,102 +1309,112 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                     
                     # Also log ESS (log_rnd stats are included in log_validation_metrics)
                     wandb_run.log({"val/ess": eval_ess}, step=start_epoch + epoch)
-                    
-                    # Call validation plotting callback if provided
-                    if validation_plot_callback is not None:
-                        try:
-                            # Convert beta/h to temps/fields for plotting
-                            if eval_beta_batch is not None:
-                                # beta = 1/(kB*T), so T = 1/(kB*beta)
-                                if isinstance(eval_beta_batch, torch.Tensor):
-                                    plot_temps = 1.0 / (eval_beta_batch * K_B)
-                                else:
-                                    plot_temps = torch.full((x.shape[0],), 1.0 / (eval_beta_batch * K_B), device=device, dtype=torch.float32)
+                
+                # Call validation plotting callback if provided (e.g. for energy/conc distributions)
+                if validation_plot_callback is not None:
+                    try:
+                        # Convert beta/h to temps/fields for plotting
+                        if eval_beta_batch is not None:
+                            # beta = 1/(kB*T), so T = 1/(kB*beta)
+                            if isinstance(eval_beta_batch, torch.Tensor):
+                                plot_temps = 1.0 / (eval_beta_batch * K_B)
                             else:
-                                # Single temp case - need to get from args or use default
-                                if hasattr(args, 'temp_min') and args.num_temps == 1:
-                                    plot_temps = torch.full((x.shape[0],), args.temp_min, device=device, dtype=torch.float32)
-                                else:
-                                    plot_temps = torch.ones(x.shape[0], device=device, dtype=torch.float32)
-                            
-                            if eval_h_batch is not None:
-                                plot_fields = eval_h_batch
+                                plot_temps = torch.full((x.shape[0],), 1.0 / (eval_beta_batch * K_B), device=device, dtype=torch.float32)
+                        else:
+                            # Single temp case - need to get from args or use default
+                            if hasattr(args, 'temp_min') and args.num_temps == 1:
+                                plot_temps = torch.full((x.shape[0],), args.temp_min, device=device, dtype=torch.float32)
                             else:
-                                plot_fields = torch.zeros(x.shape[0], device=device, dtype=torch.float32)
-                            
-                            validation_plot_callback(
-                                x=x,
-                                temps=plot_temps,
-                                fields=plot_fields,
-                                wandb_run=wandb_run,
-                                step=start_epoch + epoch,
-                            )
-                        except Exception as e:
-                            logging.warning(f"Validation plotting callback failed: {e}")
-                    
-                    # Log lattice visualization during evaluation
-                    if L is not None:
-                        try:
-                            # Get q from cfg_dict if available (for Potts model)
-                            q = cfg_dict.get('q', None) if cfg_dict is not None else None
-                            fig = _visualize_lattices(x, L, n_rows=2, n_cols=5, max_samples=10,
-                                                      beta_batch=eval_beta_batch, h_batch=eval_h_batch, q=q)
-                            wandb_run.log({"val/samples": wandb.Image(fig)}, step=start_epoch + epoch)
-                            plt.close(fig)
-                        except Exception as e:
-                            # Silently skip visualization if there's an error
-                            pass
+                                plot_temps = torch.ones(x.shape[0], device=device, dtype=torch.float32)
+                        
+                        if eval_h_batch is not None:
+                            plot_fields = eval_h_batch
+                        else:
+                            plot_fields = torch.zeros(x.shape[0], device=device, dtype=torch.float32)
+                        
+                        validation_plot_callback(
+                            x=x,
+                            temps=plot_temps,
+                            fields=plot_fields,
+                            wandb_run=wandb_run,
+                            step=start_epoch + epoch,
+                        )
+                    except Exception as e:
+                        logging.warning(f"Validation plotting callback failed: {e}")
+                
+                # Log lattice visualization during evaluation
+                if L is not None and wandb_run is not None:
+                    try:
+                        # Get q from cfg_dict if available (for Potts model)
+                        q = cfg_dict.get('q', None) if cfg_dict is not None else None
+                        fig = _visualize_lattices(x, L, n_rows=2, n_cols=5, max_samples=10,
+                                                  beta_batch=eval_beta_batch, h_batch=eval_h_batch, q=q)
+                        wandb_run.log({"val/samples": wandb.Image(fig)}, step=start_epoch + epoch)
+                        plt.close(fig)
+                    except Exception as e:
+                        # Silently skip visualization if there's an error
+                        pass
 
-                    # Plot bias analysis during validation (uses eval_batch_size)
-                    if bias_potential is not None:
-                        try:
-                            # Compute CV using provided function or default to Ising
-                            if cv_compute_fn is not None:
-                                s_eval = cv_compute_fn(x)  # Use provided CV computation function
+                # Plot bias analysis during validation (uses eval_batch_size)
+                if bias_potential is not None:
+                    try:
+                        # Compute CV using provided function or default to Ising
+                        if cv_compute_fn is not None:
+                            s_eval = cv_compute_fn(x)  # Use provided CV computation function
+                        else:
+                            # Backward compatible: default to Ising magnetization
+                            x_spins_eval = 2 * x - 1
+                            s_eval = ising2d_mag(x_spins_eval)
+                        
+                        # Compute biased reward: R_biased = R_unbiased - beta * V(s)
+                        # logf_t_vals contains R_unbiased values for the batch
+                        
+                        # Get V(s)
+                        with torch.no_grad():
+                            v_eval = bias_potential.evaluate(s_eval.to(device))
+                            
+                            # Get beta (use eval_beta_batch if available, else 1/T from bias_pot)
+                            if eval_beta_batch is not None:
+                                beta_val = eval_beta_batch
                             else:
-                                # Backward compatible: default to Ising magnetization
-                                x_spins_eval = 2 * x - 1
-                                s_eval = ising2d_mag(x_spins_eval)
+                                beta_val = 1.0 / bias_potential.T
+                                
+                            biased_reward_vals = logf_t_vals - beta_val * v_eval
                             
-                            # Compute biased reward: R_biased = R_unbiased - beta * V(s)
-                            # logf_t_vals contains R_unbiased values for the batch
-                            
-                            # Get V(s)
+                        # Sample from Replay Buffer for visualization if available
+                        s_buffer = None
+                        if replay_buffer is not None and replay_buffer.size > 0:
+                            n_sample = min(args.eval_batch_size, replay_buffer.size)
+                            x_buf, _, _ = replay_buffer.sample(n_sample)
                             with torch.no_grad():
-                                v_eval = bias_potential.evaluate(s_eval.to(device))
-                                
-                                # Get beta (use eval_beta_batch if available, else 1/T from bias_pot)
-                                if eval_beta_batch is not None:
-                                    beta_val = eval_beta_batch
+                                if cv_compute_fn is not None:
+                                    s_buffer = cv_compute_fn(x_buf.to(device))
                                 else:
-                                    beta_val = 1.0 / bias_potential.T
-                                    
-                                biased_reward_vals = logf_t_vals - beta_val * v_eval
-                                
-                            # Sample from Replay Buffer for visualization if available
-                            s_buffer = None
-                            if replay_buffer is not None and replay_buffer.size > 0:
-                                n_sample = min(args.eval_batch_size, replay_buffer.size)
-                                x_buf, _, _ = replay_buffer.sample(n_sample)
-                                with torch.no_grad():
-                                    if cv_compute_fn is not None:
-                                        s_buffer = cv_compute_fn(x_buf.to(device))
-                                    else:
-                                        # Backward compatible: default to Ising magnetization
-                                        x_spins_buf = 2 * x_buf.to(device) - 1
-                                        s_buffer = ising2d_mag(x_spins_buf)
-                            
-                            # Use custom plot function if provided, else default
-                            plot_fn = plot_bias_fn if plot_bias_fn is not None else plot_bias_analysis
-                            
-                            fig_bias = plot_fn(bias_potential, epoch, s_batch=s_eval, 
-                                                          biased_reward=biased_reward_vals, 
-                                                          s_buffer=s_buffer)
-                            if fig_bias is not None:
+                                    # Backward compatible: default to Ising magnetization
+                                    x_spins_buf = 2 * x_buf.to(device) - 1
+                                    s_buffer = ising2d_mag(x_spins_buf)
+                        
+                        # Use custom plot function if provided, else default
+                        plot_fn = plot_bias_fn if plot_bias_fn is not None else plot_bias_analysis
+                        
+                        fig_bias = plot_fn(bias_potential, epoch, s_batch=s_eval, 
+                                                      biased_reward=biased_reward_vals, 
+                                                      s_buffer=s_buffer,
+                                                      num_sites=getattr(model, 'length', None))
+                        if fig_bias is not None:
+                            if wandb_run is not None:
                                 wandb_run.log({"val/bias_analysis_plot": wandb.Image(fig_bias)}, step=start_epoch + epoch)
-                                plt.close(fig_bias)
-                        except Exception as e:
-                            print(f"Error plotting bias analysis during val: {e}")
+                            
+                            # Also save locally if save_dir is available
+                            if save_dir is not None:
+                                plot_path = f"{save_dir}/bias_analysis_epoch_{start_epoch + epoch}.png"
+                                fig_bias.savefig(plot_path, dpi=150)
+                                # if (start_epoch + epoch) % 100 == 0: # Print only occasionally to avoid spam
+                                #     print(f"Saved bias analysis plot to {plot_path}")
+                                    
+                            plt.close(fig_bias)
+                    except Exception as e:
+                        print(f"Error plotting bias analysis during val: {e}")
             model.train()
             
     return model, optimizer, ema, losses, ess_train, ess_eval

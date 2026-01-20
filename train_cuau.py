@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import os
+import sys
 import time
 
 import ase.build
@@ -17,11 +18,12 @@ import torch.optim as optim
 import utils_train
 import wandb
 from ase import Atoms
-from bias import BiasPotential
+from bias import BiasPotential, BiasPotentialMultiDim
 from energy_cuau import AuCuAlloyModel
 from model import ExponentialMovingAverage
 from model.transformer import MultiOutputTransformer
-from utils import plot_energy_au_conc_distributions
+from utils import plot_bias_analysis_2d, plot_energy_au_conc_distributions
+from utils_cuau import compute_order_parameter, get_sublattice_map
 
 K_B = ase.units.kB  # eV/K
 
@@ -47,7 +49,13 @@ class TransformerWrapper(nn.Module):
         self.model = model
         self.vocab_size = vocab_size
         self.length = length
+        self.vocab_size = vocab_size
+        self.length = length
         self.device = device
+        self.default_field = None
+
+    def set_default_field(self, field_val):
+        self.default_field = field_val
 
     def forward(self, x, beta=None, h=None):
         # x is [B, L] indices (0, 1, 2). 2 is Mask.
@@ -75,7 +83,10 @@ class TransformerWrapper(nn.Module):
             
         # Handle h -> field
         if h is None:
-            field = torch.zeros(batch_size, 1, device=self.device)
+            if self.default_field is not None:
+                field = torch.full((batch_size, 1), self.default_field, device=self.device)
+            else:
+                field = torch.zeros(batch_size, 1, device=self.device)
         elif isinstance(h, torch.Tensor):
             if h.dim() == 1:
                 field = h.unsqueeze(-1)
@@ -83,7 +94,7 @@ class TransformerWrapper(nn.Module):
                 field = h
         else:
             field = torch.full((batch_size, 1), h, device=self.device)
-            
+
         outputs = self.model(x, temp=temp, field=field)
         
         # MultiOutputTransformer now returns log probabilities [B, L, vocab_size] (like vit_rope)
@@ -114,7 +125,12 @@ class CuAuRewardWrapper:
         """
         self.energy_model = energy_model
         self.vocab_map = vocab_map # Map 0->Cu(29), 1->Au(79)
+        self.vocab_map = vocab_map # Map 0->Cu(29), 1->Au(79)
         self.default_temp_k = default_temp_k  # Store default temp for single-temp case
+        self.default_field = None
+
+    def set_default_field(self, field_val):
+        self.default_field = field_val
 
     def __call__(self, x, beta=None, h=None, J=1, use_bias=False, bias_potential=None, cv_compute_fn=None):
         """
@@ -146,7 +162,10 @@ class CuAuRewardWrapper:
         
         # Handle field: h is in energy units (eV), use directly as fields
         if h is None:
-            fields = torch.zeros(x.shape[0], device=x.device, dtype=torch.float32)
+            if self.default_field is not None:
+                fields = torch.full((x.shape[0],), float(self.default_field), device=x.device, dtype=torch.float32)
+            else:
+                fields = torch.zeros(x.shape[0], device=x.device, dtype=torch.float32)
         else:
             if isinstance(h, torch.Tensor):
                 fields = h.to(x.device)
@@ -192,7 +211,34 @@ class CuAuRewardWrapper:
         return log_reward
 
 
+
+# Workaround for argparse negative number issue with cv_min/cv_max
+def preprocess_args(argv):
+    new_argv = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '--cv_min' or arg == '--cv_max':
+            if i + 1 < len(argv):
+                val = argv[i+1]
+                if val.startswith('-'):
+                    # Check if it looks like a number (or list of numbers)
+                    try:
+                        parts = val.split(',')
+                        float(parts[0])
+                        # It is a number, combine with = to avoid argparse flag confusion
+                        new_argv.append(f'{arg}={val}')
+                        i += 2
+                        continue
+                    except ValueError:
+                        pass
+        new_argv.append(arg)
+        i += 1
+    return new_argv
+
 def get_args():
+    # Preprocess sys.argv to handle negative flags
+    sys.argv = [sys.argv[0]] + preprocess_args(sys.argv[1:])
     parser = argparse.ArgumentParser(description="Train CuAu Alloy Model")
     
     # System Config
@@ -226,17 +272,20 @@ def get_args():
     parser.add_argument("--temp_max", type=float, default=1000.0)
     # utils_train expects 'temps' arg for multi-temp training
     parser.add_argument("--num_temps", type=int, default=16) # for creating temp grid
+    parser.add_argument("--field", type=float, default=0.0, help="External field (chemical potential bias) in eV")
     
     # Metadynamics / Bias
     parser.add_argument("--use_bias", action="store_true", help="Use metadynamics bias")
     parser.add_argument("--bias_method", type=str, default="binned", choices=["binned", "gaussian"])
-    parser.add_argument("--bias_sigma", type=float, default=0.05)
+    parser.add_argument("--bias_sigma", type=str, default="0.05", help="Sigma for Gaussian bias kernel (can be list)")
     parser.add_argument("--bias_height", type=float, default=0.1, 
                         help="Initial bias height. For diffusion samplers with batch updates, this is normalized by batch_size by default (see --normalize_bias_by_batch)")
     parser.add_argument("--bias_factor", type=float, default=10.0)
-    parser.add_argument("--bias_grid_size", type=int, default=100)
-    parser.add_argument("--cv_min", type=float, default=0.0, help="Minimum CV value (default: 0.0 for Au concentration)")
-    parser.add_argument("--cv_max", type=float, default=1.0, help="Maximum CV value (default: 1.0 for Au concentration)")
+    parser.add_argument("--bias_grid_size", type=str, default="100", help="Grid size (can be list)")
+    parser.add_argument("--cv_type", type=str, default="composition", choices=["composition", "composition_order"],
+                        help="Type of Collective Variables to use")
+    parser.add_argument("--cv_min", type=str, default="0.0", help="Minimum CV value (comma-separated list for 2D)")
+    parser.add_argument("--cv_max", type=str, default="1.0", help="Maximum CV value (comma-separated list for 2D)")
     parser.add_argument("--scale_bias_with_size", action="store_true")
     parser.add_argument("--no_normalize_bias_by_batch", dest="normalize_bias_by_batch", action="store_false", default=True,
                         help="Disable normalization of bias_height by batch_size (default: normalization enabled). Recommended for diffusion samplers that deposit bias more frequently than traditional MCMC.")
@@ -364,6 +413,15 @@ def main():
         ).to(device)
         
         net = TransformerWrapper(base_net, vocab_size=vocab_size, length=num_sites, device=device)
+        
+        # Determine default field (if using single field and provided)
+        # Even if multiple temps, if we have a single field we might want to default it if h is None?
+        # But if multiple temps, h_batch should be passed.
+        # This safeguard is mainly for the single-temp/field case where utils_train passes None.
+        if args.field != 0.0:
+             print(f"Setting default field for wrappers: {args.field}")
+             reward_fn_base.set_default_field(args.field)
+             net.set_default_field(args.field)
     else:
         # MLP not yet adapted for wrapper
         raise NotImplementedError("MLP not yet adapted for new training loop")
@@ -383,16 +441,55 @@ def main():
         # K_B is already imported from ase.units (eV/K)
         T_val = K_B * T_kelvin  # Convert Kelvin to energy (eV)
         
-        # For CuAu, CV is Au concentration [0, 1]
-        # Allow override via args, but default to [0, 1] for CuAu
-        cv_min = args.cv_min  # Default 0.0 for concentration
-        cv_max = args.cv_max  # Default 1.0 for concentration
+        # Helper to parse lists
+        def parse_list(arg, dtype=float):
+            if isinstance(arg, (int, float)): return [dtype(arg)]
+            return [dtype(x) for x in arg.split(',')]
+            
+        cv_min_list = parse_list(args.cv_min, float)
+        cv_max_list = parse_list(args.cv_max, float)
+        grid_size_list = parse_list(args.bias_grid_size, int)
+        sigma_list = parse_list(args.bias_sigma, float)
         
+        # If 2D but user provided scalar, expand?
+        # BiasPotentialMultiDim handles scalar->list, but we generally want to be explicit?
+        # The parser helper returns list.
+        
+        # Determine CV Function and CV Params
+        if args.cv_type == "composition":
+            cv_min = cv_min_list[0]
+            cv_max = cv_max_list[0]
+            bias_grid_size = grid_size_list[0]
+            bias_sigma = sigma_list[0]
+            
+            # Use 1D Compute Fn
+            cv_compute_fn_final = compute_cv_cuau
+            
+        elif args.cv_type == "composition_order":
+            # 2D CV: Comp, Order
+            # If user didn't provide enough args, default or error?
+            if len(cv_min_list) < 2: cv_min_list = [0.0, 0.0] 
+            if len(cv_max_list) < 2: cv_max_list = [1.0, 1.0] # Order param max 1.0
+            if len(grid_size_list) < 2: grid_size_list = [100, 100]
+            if len(sigma_list) < 2: sigma_list = [0.05, 0.05]
+            
+            # Precompute sublattice map
+            # args.size is [Nx, Ny, Nz]
+            sublattice_map = get_sublattice_map(energy_model.atoms, tuple(args.size)).to(device)
+            
+            def compute_cv_cuau_2d(x):
+                # Comp: [B]
+                comp = energy_model.get_concentrations(x)
+                # Order: [B]
+                order = compute_order_parameter(x, sublattice_map, num_sites)
+                # Stack: [B, 2]
+                return torch.stack([comp, order], dim=1)
+                
+            cv_compute_fn_final = compute_cv_cuau_2d
+            
         # Normalize bias_height by batch_size for diffusion samplers
         # Traditional metadynamics deposits 1 hill per step with height 0.1-0.5 kBT
         # Diffusion samplers deposit batch_size hills per cycle, so normalize accordingly
-        # (Nam et al. 2020: "the Gaussian height h must be reduced, since diffusion 
-        #  samplers generate uncorrelated samples and thus deposit bias more frequently")
         effective_bias_height = args.bias_height
         if args.normalize_bias_by_batch:
             effective_bias_height = args.bias_height / args.batch_size
@@ -403,22 +500,39 @@ def main():
         else:
             print(f"Bias height (no normalization): {effective_bias_height:.6f} eV per hill")
         
-        print(f"Initializing Bias: sigma={args.bias_sigma}, factor={args.bias_factor}, CV range=[{cv_min}, {cv_max}]")
+        print(f"Initializing Bias: method={args.bias_method}, CV={args.cv_type}")
         print(f"Temperature: {T_kelvin} K = {T_val:.6f} eV (kB*T)")
         
         kernel_type = "delta" if args.bias_method == "binned" else "gaussian"
-        bias_potential = BiasPotential(
-            cv_min=cv_min,
-            cv_max=cv_max,
-            grid_size=args.bias_grid_size,
-            sigma=args.bias_sigma,
-            initial_height=effective_bias_height,
-            bias_factor=args.bias_factor,
-            T=T_val,  # Temperature in kB*T units (eV)
-            kernel_type=kernel_type,
-            device=device,
-            energy_scaling=energy_scaling_val
-        )
+        
+        if args.cv_type == "composition":
+             print(f"1D Bias: sigma={bias_sigma}, factor={args.bias_factor}, CV range=[{cv_min}, {cv_max}]")
+             bias_potential = BiasPotential(
+                cv_min=cv_min,
+                cv_max=cv_max,
+                grid_size=bias_grid_size,
+                sigma=bias_sigma,
+                initial_height=effective_bias_height,
+                bias_factor=args.bias_factor,
+                T=T_val, 
+                kernel_type=kernel_type,
+                device=device,
+                energy_scaling=energy_scaling_val
+            )
+        else:
+             print(f"2D Bias: sigma={sigma_list}, factor={args.bias_factor}, CV range=[{cv_min_list}, {cv_max_list}]")
+             bias_potential = BiasPotentialMultiDim(
+                cv_min=cv_min_list,
+                cv_max=cv_max_list,
+                grid_size=grid_size_list,
+                sigma=sigma_list,
+                initial_height=effective_bias_height,
+                bias_factor=args.bias_factor,
+                T=T_val, 
+                kernel_type=kernel_type,
+                device=device,
+                energy_scaling=energy_scaling_val
+             )
         
         # Create biased reward function now that bias_potential exists
         def create_biased_reward_fn(base_reward, bias_pot, cv_fn):
@@ -426,9 +540,10 @@ def main():
                 return base_reward(x, beta=beta, h=h, J=J, use_bias=use_bias,
                                   bias_potential=bias_pot, cv_compute_fn=cv_fn)
             return biased_reward
-        reward_fn = create_biased_reward_fn(reward_fn_base, bias_potential, compute_cv_cuau)
+        reward_fn = create_biased_reward_fn(reward_fn_base, bias_potential, cv_compute_fn_final)
     else:
         reward_fn = reward_fn_base
+        cv_compute_fn_final = compute_cv_cuau # Default for plotting etc
 
     # 5. Load Checkpoint
     checkpoint = (
@@ -472,7 +587,7 @@ def main():
     # and computes beta = 1/T. So we pass temps in Kelvin, not scaled by kB.
     temps_k = np.linspace(args.temp_min, args.temp_max, args.num_temps)
     args.temps = temps_k  # Pass temperatures in Kelvin (not scaled by kB)
-    args.fields = np.zeros(1) # Can extend for chemical potential
+    args.fields = np.array([args.field]) # Use provided field
 
     print("Starting training with utils_train.train...")
     
@@ -503,11 +618,12 @@ def main():
         save_dir=args.out_dir,
         cfg_dict=vars(args),
         validation_plot_callback=validation_plot_callback,
-        cv_compute_fn=compute_cv_cuau,
+        cv_compute_fn=cv_compute_fn_final,
         buffer_size=args.buffer_size,
         buffer_ratio=args.buffer_ratio,
         buffer_n_bins=args.buffer_n_bins,
         buffer_strategy=args.buffer_strategy,
+        plot_bias_fn=plot_bias_analysis_2d if args.cv_type == "composition_order" else None,
     )
 
 if __name__ == "__main__":
