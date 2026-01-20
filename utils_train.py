@@ -8,7 +8,6 @@ import torch.distributed as dist
 import wandb
 from matplotlib.colors import ListedColormap
 from tqdm import tqdm
-
 from utils import ess, plot_bias_analysis, sample_categorical_logits
 from utils_ising import ising2d_mag
 
@@ -26,6 +25,7 @@ class ReplayBuffer:
     
     Stores samples (x, beta, h) and allows sampling mixed batches.
     Designed to be stored on CPU to save VRAM, with on-demand move to GPU.
+    Supports N-dimensional CV binning via flattening.
     """
     def __init__(self, buffer_size, x_shape, device='cpu', dtype=torch.float32, 
                  cv_min=None, cv_max=None, n_bins=1, strategy='fifo'):
@@ -41,41 +41,103 @@ class ReplayBuffer:
         self.x = torch.zeros((buffer_size, *x_shape), dtype=torch.long, device=self.storage_device)
         self.beta = torch.zeros(buffer_size, dtype=dtype, device=self.storage_device)
         self.h = torch.zeros(buffer_size, dtype=dtype, device=self.storage_device)
-        self.cv = torch.zeros(buffer_size, dtype=dtype, device=self.storage_device)
-        self.has_conditions = False # Track if we are actually storing conditions
         
-        # CV Binning setup
-        self.n_bins = n_bins
-        self.cv_min = cv_min if cv_min is not None else -1.0
-        self.cv_max = cv_max if cv_max is not None else 1.0
-        # Avoid division by zero if min==max (shouldn't happen but safety first)
+        # CV storage: [buffer_size, cv_dim]
+        # We need to determine cv_dim from inputs
+        
+        # Parse CV Binning setup
+        def ensure_tensor(val, default):
+            if val is None: return torch.tensor([default], dtype=dtype, device=self.storage_device)
+            if isinstance(val, (int, float)): return torch.tensor([val], dtype=dtype, device=self.storage_device)
+            if isinstance(val, list): return torch.tensor(val, dtype=dtype, device=self.storage_device)
+            if isinstance(val, torch.Tensor): return val.to(dtype=dtype, device=self.storage_device)
+            return torch.tensor([default], dtype=dtype, device=self.storage_device)
+            
+        self.cv_min = ensure_tensor(cv_min, -1.0)
+        self.cv_max = ensure_tensor(cv_max, 1.0)
+        
+        # Handle n_bins (can be int or list of ints)
+        if isinstance(n_bins, int):
+            self.n_bins_per_dim = torch.tensor([n_bins] * self.cv_min.shape[0], dtype=torch.long, device=self.storage_device)
+        elif isinstance(n_bins, list):
+            self.n_bins_per_dim = torch.tensor(n_bins, dtype=torch.long, device=self.storage_device)
+        elif isinstance(n_bins, torch.Tensor):
+            self.n_bins_per_dim = n_bins.to(dtype=torch.long, device=self.storage_device)
+        else:
+            self.n_bins_per_dim = torch.tensor([1] * self.cv_min.shape[0], dtype=torch.long, device=self.storage_device)
+            
+        self.cv_dim = self.cv_min.shape[0]
+        
+        # Ensure consistency
+        if self.cv_max.shape[0] != self.cv_dim:
+             raise ValueError(f"cv_min has dim {self.cv_dim} but cv_max has dim {self.cv_max.shape[0]}")
+        if self.n_bins_per_dim.shape[0] != self.cv_dim:
+             # Try to broadcast scalar n_bins
+             if self.n_bins_per_dim.shape[0] == 1:
+                  self.n_bins_per_dim = self.n_bins_per_dim.repeat(self.cv_dim)
+             else:
+                  raise ValueError(f"cv_min has dim {self.cv_dim} but n_bins has dim {self.n_bins_per_dim.shape[0]}")
+
+        # Compute bin widths
         denom = (self.cv_max - self.cv_min)
-        self.bin_width = denom / n_bins if denom > 1e-6 else 1.0
+        self.bin_width = torch.where(denom > 1e-6, denom / self.n_bins_per_dim.float(), torch.ones_like(denom))
+        
+        # Compute total bins (product of bins per dim)
+        self.total_bins = self.n_bins_per_dim.prod().item()
+        
+        # Strides for flattening: [N2*N3*..., N3*..., ..., 1]
+        self.bin_strides = torch.ones(self.cv_dim, dtype=torch.long, device=self.storage_device)
+        cum_prod = 1
+        for i in range(self.cv_dim - 1, -1, -1):
+            self.bin_strides[i] = cum_prod
+            cum_prod *= self.n_bins_per_dim[i].item()
+            
+        # CV Storage
+        self.cv = torch.zeros((buffer_size, self.cv_dim), dtype=dtype, device=self.storage_device)
+        self.has_conditions = False 
         
         if self.strategy == 'balanced':
             # Partitioned storage: each bin gets a fixed slice of the buffer
-            self.max_per_bin = buffer_size // n_bins
+            self.max_per_bin = buffer_size // self.total_bins
             if self.max_per_bin == 0:
-                raise ValueError(f"Buffer size {buffer_size} too small for {n_bins} bins.")
+                raise ValueError(f"Buffer size {buffer_size} too small for {self.total_bins} bins.")
             
             # Pointers and counts for each bin
-            self.bin_ptrs = torch.zeros(n_bins, dtype=torch.long, device=self.storage_device)
-            self.bin_counts = torch.zeros(n_bins, dtype=torch.long, device=self.storage_device)
+            self.bin_ptrs = torch.zeros(self.total_bins, dtype=torch.long, device=self.storage_device)
+            self.bin_counts = torch.zeros(self.total_bins, dtype=torch.long, device=self.storage_device)
             self.active_bins = [] # For fast sampling
             
             # Warn if buffer_size is not perfectly divisible
-            if buffer_size % n_bins != 0:
-                 print(f"Warning: Buffer size {buffer_size} not divisible by {n_bins}. Using {self.max_per_bin * n_bins} slots.")
+            if buffer_size % self.total_bins != 0:
+                 print(f"Warning: Buffer size {buffer_size} not divisible by {self.total_bins}. Using {self.max_per_bin * self.total_bins} slots.")
         else:
-            # FIFO strategy (original behavior with bins tracking)
+            # FIFO strategy
             # Bin storage: list of lists of indices
-            self.bins = [[] for _ in range(n_bins)]
+            self.bins = [[] for _ in range(self.total_bins)]
             
             # Index tracking for O(1) removal
-            # sample_bins[i] = which bin sample i is in
             self.sample_bins = torch.full((buffer_size,), -1, dtype=torch.long, device=self.storage_device)
-            # bin_pos[i] = index of sample i in self.bins[sample_bins[i]]
             self.bin_pos = torch.full((buffer_size,), -1, dtype=torch.long, device=self.storage_device)
+
+    def _get_bin_indices(self, cv):
+        """Compute flattened bin indices for given CVs."""
+        # cv: [B, D] or [B]
+        if cv.ndim == 1 and self.cv_dim == 1:
+            cv = cv.unsqueeze(-1)
+        elif cv.ndim == 1 and self.cv_dim > 1:
+            # Should not happen if correctly passed, but maybe handle error
+            raise ValueError(f"CV has dim 1 but buffer expects {self.cv_dim}")
+            
+        # [B, D]
+        bin_indices_per_dim = ((cv - self.cv_min) / self.bin_width).floor().long()
+        
+        # Clamp each dimension
+        for d in range(self.cv_dim):
+            bin_indices_per_dim[:, d] = bin_indices_per_dim[:, d].clamp(0, self.n_bins_per_dim[d] - 1)
+            
+        # Flatten: sum(idx_d * stride_d)
+        flat_indices = (bin_indices_per_dim * self.bin_strides).sum(dim=1)
+        return flat_indices
 
     def add(self, x, beta=None, h=None, cv=None):
         """Add a batch of samples to the buffer."""
@@ -90,14 +152,14 @@ class ReplayBuffer:
     def _add_balanced(self, x, beta, h, cv):
         if cv is None:
              # If balanced mode but no CV, dump to bin 0 (fallback)
-             cv = torch.full((x.shape[0],), self.cv_min, device=self.storage_device)
+             # Need vector of zeros
+             bin_indices = torch.zeros(x.shape[0], dtype=torch.long, device=self.storage_device)
+             cv_to_store = torch.ones((x.shape[0], self.cv_dim), device=self.storage_device) * self.cv_min # Placeholder
         else:
              cv = cv.to(self.storage_device)
+             cv_to_store = cv
+             bin_indices = self._get_bin_indices(cv)
              
-        # Compute bins for input samples
-        bin_indices = ((cv - self.cv_min) / self.bin_width).floor().long()
-        bin_indices = bin_indices.clamp(0, self.n_bins - 1)
-        
         # We process each bin separately to allow vectorization within bins
         # This is reasonably fast because n_bins is small (approx 10-100)
         unique_bins = torch.unique(bin_indices)
@@ -140,7 +202,10 @@ class ReplayBuffer:
             
             # Write to buffer
             self.x[global_indices] = x_b
-            self.cv[global_indices] = cv[mask]
+            if cv_to_store.ndim == 1 and self.cv_dim == 1:
+                self.cv[global_indices, 0] = cv_to_store[mask]
+            else:
+                self.cv[global_indices] = cv_to_store[mask]
             
             if beta is not None:
                 self.has_conditions = True
@@ -211,16 +276,19 @@ class ReplayBuffer:
         
         if cv is not None:
              cv_in = cv.to(self.storage_device)
-             self.cv[indices] = cv_in
+             
+             if cv_in.ndim == 1 and self.cv_dim == 1:
+                self.cv[indices, 0] = cv_in
+             else:
+                self.cv[indices] = cv_in
+                
              # Compute new bins
-             # bin = floor((cv - min) / width)
-             # clamp to [0, n_bins-1]
-             bin_indices = ((cv_in - self.cv_min) / self.bin_width).floor().long()
-             bin_indices = bin_indices.clamp(0, self.n_bins - 1)
+             bin_indices = self._get_bin_indices(cv_in)
+             bin_indices = bin_indices.clamp(0, self.total_bins - 1)
         else:
-             # Default to bin 0 if no CV provided (or uniform random? No, better 0)
-             # Only happens if user forgets to pass CV.
+             # Default to bin 0
              bin_indices = torch.zeros(batch_size, dtype=torch.long, device=self.storage_device)
+
              
         bin_indices_np = bin_indices.numpy()
         
@@ -339,7 +407,8 @@ class ReplayBuffer:
             'storage_device': self.storage_device,
             'dtype': self.beta.dtype,  # Use beta to get dtype
             'strategy': self.strategy,
-            'n_bins': self.n_bins,
+            # 'n_bins': self.n_bins, # REMOVED: Replaced by n_bins_per_dim
+            'n_bins_per_dim': self.n_bins_per_dim.clone(),
             'cv_min': self.cv_min,
             'cv_max': self.cv_max,
             'bin_width': self.bin_width,
@@ -401,10 +470,19 @@ class ReplayBuffer:
                 raise ValueError(f"Strategy mismatch: checkpoint has {state_dict['strategy']}, "
                                f"but current buffer has {self.strategy}")
         
-        if 'n_bins' in state_dict:
-            if state_dict['n_bins'] != self.n_bins:
-                raise ValueError(f"n_bins mismatch: checkpoint has {state_dict['n_bins']}, "
-                               f"but current buffer has {self.n_bins}")
+        if 'n_bins_per_dim' in state_dict:
+             if not torch.equal(state_dict['n_bins_per_dim'], self.n_bins_per_dim):
+                  # Could also be loose check if we just want to load data?
+                  # But consistency is important for bin mapping
+                  raise ValueError(f"n_bins_per_dim mismatch: checkpoint has {state_dict['n_bins_per_dim']}, "
+                                   f"but current buffer has {self.n_bins_per_dim}")
+        elif 'n_bins' in state_dict:
+             # Legacy check: if stored as scalar n_bins
+             legacy_n_bins = state_dict['n_bins']
+             # Check if current config matches this scalar (all dims equal)
+             if not (self.n_bins_per_dim == legacy_n_bins).all():
+                 raise ValueError(f"Legacy n_bins mismatch: checkpoint has {legacy_n_bins}, "
+                                   f"but current buffer has {self.n_bins_per_dim}")
         
         # Load state variables
         if 'ptr' in state_dict:
@@ -441,14 +519,22 @@ class ReplayBuffer:
             if 'bins' in state_dict:
                 # Convert list of tensors back to list of lists
                 bins_tensors = state_dict['bins']
-                if len(bins_tensors) != self.n_bins:
+                if len(bins_tensors) != self.total_bins:
                     raise ValueError(f"Number of bins mismatch: checkpoint has {len(bins_tensors)}, "
-                                   f"but current buffer has {self.n_bins}")
+                                   f"but current buffer has {self.total_bins}")
                 self.bins = [tensor.tolist() for tensor in bins_tensors]
             if 'sample_bins' in state_dict:
                 self.sample_bins.copy_(state_dict['sample_bins'])
             if 'bin_pos' in state_dict:
                 self.bin_pos.copy_(state_dict['bin_pos'])
+            
+            # Legacy fix: If switching from scalar CV to tensor CV in buffer state
+            if 'cv' in state_dict and state_dict['cv'].ndim == 1 and self.cv_dim == 1:
+                self.cv[:, 0].copy_(state_dict['cv'])
+            elif 'cv' in state_dict:
+                # Handle dimension mismatch if buffer size changed or cv_dim changed?
+                # Assume match for now, or copy flexible
+                pass
 
 
 def compute_model_log_prob(model, x, beta=None, h=None):
@@ -986,11 +1072,34 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
     if buffer_size > 0:
         # Determine dimension D from model
         D = model.length
-        cv_min_val = args.cv_min if hasattr(args, 'cv_min') else -1.0
-        cv_max_val = args.cv_max if hasattr(args, 'cv_max') else 1.0
+        # Parse CV arguments carefully
+        # They might be strings (comma separated), floats, or lists
+        def parse_arg_list(arg):
+            if isinstance(arg, str):
+                try:
+                    return [float(x) for x in arg.split(',')]
+                except ValueError:
+                    return [-1.0] # Fallback
+            elif isinstance(arg, (list, tuple)):
+                return arg
+            elif isinstance(arg, (int, float)):
+                return [arg]
+            else:
+                return [-1.0]
+
+        cv_min_raw = args.cv_min if hasattr(args, 'cv_min') else -1.0
+        cv_max_raw = args.cv_max if hasattr(args, 'cv_max') else 1.0
+        
+        cv_min_val = parse_arg_list(cv_min_raw)
+        cv_max_val = parse_arg_list(cv_max_raw)
+        
+        # Similar for n_bins? Usually integer, but could be list?
+        # args.buffer_n_bins is usually int. If user wants per-dim bins, they might need to update arg parser.
+        # For now assume scalar n_bins applies to all dims or user passes list manually if calling function.
+        buffer_n_bins_val = buffer_n_bins 
         
         replay_buffer = ReplayBuffer(buffer_size, (D,), device=device,
-                                     cv_min=cv_min_val, cv_max=cv_max_val, n_bins=buffer_n_bins, strategy=buffer_strategy)
+                                     cv_min=cv_min_val, cv_max=cv_max_val, n_bins=buffer_n_bins_val, strategy=buffer_strategy)
         print(f"Initialized ReplayBuffer with size {buffer_size}, mixing ratio {buffer_ratio}, n_bins {buffer_n_bins}, strategy {buffer_strategy}")
         
         # Load buffer state from checkpoint if provided
@@ -1080,7 +1189,6 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                     "train/field_mean": float(h_batch.cpu().mean().item()),
                     "train/field_std": float(h_batch.cpu().std().item()),
                 }
-
         if args.loss_fn == 'wdce':
             with torch.no_grad():
                 if x_saved is None or epoch % args.resample_every_n_step == 0:
