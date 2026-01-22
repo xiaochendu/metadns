@@ -43,6 +43,8 @@ parser.add_argument('--no-wandb', dest='use_wandb', action='store_false', help="
 parser.set_defaults(use_wandb=False)
 parser.add_argument('--wandb_project', type=str, default='mdns-ising', help="wandb project name")
 parser.add_argument('--wandb_run_name', type=str, default=None, help="wandb run name")
+parser.add_argument('--wandb_mode', type=str, default='online', choices=['offline', 'online', 'disabled'],
+                    help="wandb logging mode: 'online' (default), 'offline' (for HPC without internet), or 'disabled'")
 parser.add_argument('--temps', type=float, nargs='+', default=None,
                     help='List of temperatures (overrides --beta). If provided, batch_size must be divisible by num_temps * num_fields.')
 parser.add_argument('--fields', type=float, nargs='+', default=None,
@@ -191,11 +193,13 @@ if args.use_wandb:
         except Exception as e:
             print(f"Warning: Could not determine start step from checkpoint: {e}")
     
+    wandb_mode = args.wandb_mode if args.wandb_mode != "disabled" else "disabled"
     wandb_init_kwargs = {
         "project": args.wandb_project,
         "name": args.wandb_run_name or args.dir_name,
         "dir": str(dir_name),
         "config": cfg,
+        "mode": wandb_mode,
     }
     
     # If resuming, add id and resume parameters

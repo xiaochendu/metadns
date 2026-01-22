@@ -2,6 +2,7 @@ from warnings import simplefilter
 
 import matplotlib.pyplot as plt
 import torch
+
 from model import ExponentialMovingAverage, get_rope_vit_model
 from utils import Dict2Obj, plot_bias_analysis_2d, plot_loss_ess
 from utils_potts import potts2d_ham, potts2d_magnetization_all
@@ -17,6 +18,7 @@ from pprint import pformat
 
 import numpy as np
 import wandb
+
 from bias import BiasPotential, BiasPotentialMultiDim
 
 parser = argparse.ArgumentParser()
@@ -58,6 +60,8 @@ parser.add_argument('--no-wandb', dest='use_wandb', action='store_false', help="
 parser.set_defaults(use_wandb=False)
 parser.add_argument('--wandb_project', type=str, default='mdns-potts', help="wandb project name")
 parser.add_argument('--wandb_run_name', type=str, default=None, help="wandb run name")
+parser.add_argument('--wandb_mode', type=str, default='online', choices=['offline', 'online', 'disabled'],
+                    help="wandb logging mode: 'online' (default), 'offline' (for HPC without internet), or 'disabled'")
 # Workaround for argparse negative number issue with cv_min/cv_max
 def preprocess_args(argv):
     new_argv = []
@@ -163,11 +167,13 @@ with open(dir_name / 'config.json', 'w') as f:
 
 wandb_run = None
 if args.use_wandb:
+    wandb_mode = args.wandb_mode if args.wandb_mode != "disabled" else "disabled"
     wandb_run = wandb.init(
         project=args.wandb_project,
         name=args.wandb_run_name or args.dir_name,
         dir=str(dir_name),
         config=cfg,
+        mode=wandb_mode
     )
     
 if not args.use_anneal:

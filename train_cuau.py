@@ -15,9 +15,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import utils_train
 import wandb
 from ase import Atoms
+
+import utils_train
 from bias import BiasPotential, BiasPotentialMultiDim
 from energy_cuau import AuCuAlloyModel
 from model import ExponentialMovingAverage
@@ -302,6 +303,8 @@ def get_args():
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="mdns-cuau")
     parser.add_argument("--wandb_run_name", type=str, default=None)
+    parser.add_argument("--wandb_mode", type=str, default="online", choices=["offline", "online", "disabled"],
+                        help="wandb logging mode: 'online' (default), 'offline' (for HPC without internet), or 'disabled'")
     
     return parser.parse_args()
 
@@ -357,11 +360,13 @@ def main():
 
     wandb_run = None
     if args.wandb:
+        wandb_mode = args.wandb_mode if args.wandb_mode != "disabled" else "disabled"
         wandb_run = wandb.init(
             project=args.wandb_project, 
             name=args.wandb_run_name,
             config=args,
-            dir=args.out_dir
+            dir=args.out_dir,
+            mode=wandb_mode
         )
     
     # 1. Setup Energy Model
