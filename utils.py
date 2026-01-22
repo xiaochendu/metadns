@@ -423,7 +423,7 @@ def plot_bias_analysis_2d(bias_potential, epoch, s_batch=None, biased_reward=Non
         else:
             samples_np = None
             
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12), constrained_layout=True)
         axes = axes.flatten()
         
         # 1. Raw Distribution (Histogram) - Top Left
@@ -516,7 +516,7 @@ def plot_bias_analysis_2d(bias_potential, epoch, s_batch=None, biased_reward=Non
         else:
             axes[3].axis('off')
         
-        plt.tight_layout()
+        # plt.tight_layout() # causes error with colorbars sometimes
         
         if save_path:
              plt.savefig(save_path, dpi=150)
