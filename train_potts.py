@@ -50,6 +50,7 @@ parser.add_argument('--cv_min', type=str, default="-0.6,-1.0", help="Min CV boun
 parser.add_argument('--cv_max', type=str, default="1.1,1.0", help="Max CV bounds (comma-separated list of floats, supports N-dimensions)")
 parser.add_argument('--scale_bias_with_size', action='store_true', help='Scale bias Delta_T with system size')
 parser.add_argument('--no_normalize_bias_by_batch', dest='normalize_bias_by_batch', action='store_false', default=True, help="Disable bias height norm by batch size")
+parser.add_argument('--save_every', type=int, default=10000, help='Save checkpoint every N steps')
 parser.add_argument('--buffer_size', type=int, default=0, help='Replay buffer size')
 parser.add_argument('--buffer_ratio', type=float, default=0.0, help='Ratio of buffer samples in batch')
 parser.add_argument('--buffer_n_bins', type=int, default=1, help='Number of bins for CV-based Replay Buffer')
@@ -145,10 +146,15 @@ cfg = {'tokens': q,
        'scale_bias_with_size': args.scale_bias_with_size,
        'buffer_size': args.buffer_size,
        'buffer_ratio': args.buffer_ratio,
+       'cv_min': args.cv_min,
+       'cv_max': args.cv_max,
+       'save_every': args.save_every,
        'buffer_n_bins': args.buffer_n_bins,
        'buffer_strategy': args.buffer_strategy,
-       'cv_min': args.cv_min,
-       'cv_max': args.cv_max}
+       'wandb': args.use_wandb,
+       'wandb_project': args.wandb_project,
+       'wandb_run_name': args.wandb_run_name,
+       'wandb_mode': args.wandb_mode}
 
 model = get_rope_vit_model(L, embed_dim=cfg['model']['hidden_size'],
                            depth=cfg['model']['n_blocks'],
