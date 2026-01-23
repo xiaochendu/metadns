@@ -373,7 +373,7 @@ def main():
                 logs["bias/boundary_state2"] = rel_energies[5].item()
                 logs["bias/boundary_state3"] = rel_energies[6].item()
 
-                # Save bias potential state to dictionary
+                # Save bias potential state (state_dict returns cloned tensors, so each step is a snapshot)
                 bias_states_dict[step] = bias_pot.state_dict()
                 
                 # Save all bias states to a single file

@@ -145,6 +145,8 @@ cfg = {'tokens': q,
        'scale_bias_with_size': args.scale_bias_with_size,
        'buffer_size': args.buffer_size,
        'buffer_ratio': args.buffer_ratio,
+       'buffer_n_bins': args.buffer_n_bins,
+       'buffer_strategy': args.buffer_strategy,
        'cv_min': args.cv_min,
        'cv_max': args.cv_max}
 
@@ -167,16 +169,45 @@ with open(dir_name / 'config.json', 'w') as f:
 
 wandb_run = None
 if args.use_wandb:
+    # Check for wandb run ID in environment variable (set by resume_training.py)
+    wandb_run_id = os.environ.get("WANDB_RUN_ID", None)
+    wandb_resume = os.environ.get("WANDB_RESUME", "never")
+    
+    # Calculate start_epoch from checkpoint if resuming (needed for wandb step)
+    wandb_start_step = None
+    if wandb_run_id and resume_path is not None:
+        try:
+            checkpoint = torch.load(resume_path, map_location='cpu')
+            losses = checkpoint.get('losses', [])
+            wandb_start_step = len(losses) if losses else 0
+        except Exception as e:
+            print(f"Warning: Could not determine start step from checkpoint: {e}")
+    
     wandb_mode = args.wandb_mode if args.wandb_mode != "disabled" else "disabled"
-    wandb_run = wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_run_name or args.dir_name,
-        dir=str(dir_name),
-        config=cfg,
-        mode=wandb_mode
-    )
+    wandb_init_kwargs = {
+        "project": args.wandb_project,
+        "name": args.wandb_run_name or args.dir_name,
+        "dir": str(dir_name),
+        "config": cfg,
+        "mode": wandb_mode,
+    }
+    
+    # If resuming, add id and resume parameters
+    if wandb_run_id:
+        wandb_init_kwargs["id"] = wandb_run_id
+        wandb_init_kwargs["resume"] = wandb_resume
+        print(f"Resuming wandb run with ID: {wandb_run_id}")
+        if wandb_start_step is not None:
+            print(f"Starting wandb logging from step: {wandb_start_step}")
+    
+    wandb_run = wandb.init(**wandb_init_kwargs)
+    
+    # Note: wandb automatically handles step tracking when resuming
+    if wandb_start_step is not None:
+        print(f"Note: All logging will use step numbers starting from {wandb_start_step}")
     
 if not args.use_anneal:
+    start_epoch = 0
     if resume_path is not None:
         print("Loading checkpoint from: ", resume_path)
         checkpoint = torch.load(resume_path, map_location=device)
@@ -187,6 +218,9 @@ if not args.use_anneal:
         ess_train = checkpoint['ess_train']
         ess_eval = checkpoint['ess_eval']
         bias_state = checkpoint.get('bias_potential', None)
+        # Calculate starting epoch from checkpoint
+        start_epoch = len(losses) if losses else 0
+        print(f"Resuming from epoch {start_epoch}")
     else:
         print("No checkpoint provided, starting from scratch")
         losses = []
@@ -338,7 +372,8 @@ if not args.use_anneal:
         buffer_size=args.buffer_size, buffer_ratio=args.buffer_ratio,
         buffer_n_bins=args.buffer_n_bins, buffer_strategy=args.buffer_strategy,
         save_dir=dir_name, cfg_dict=cfg,
-        plot_bias_fn=plot_bias_analysis_2d) # Pass 2D plot function
+        plot_bias_fn=plot_bias_analysis_2d,
+        start_epoch=start_epoch) # Pass start_epoch for proper progress bar
     
     fig, ax = plot_loss_ess(losses, ess_train, ess_eval=ess_eval)
     plt.savefig(f"{dir_name}/loss_ess.png")
