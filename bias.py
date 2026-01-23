@@ -157,10 +157,10 @@ class BiasPotential:
         return self.grid_vals.detach().cpu().numpy(), self.bias_grid.detach().cpu().numpy()
 
     def state_dict(self):
-        """Return state dictionary for saving."""
+        """Return state dictionary for saving. Clones tensors so saved state is a snapshot."""
         return {
-            'bias_grid': self.bias_grid,
-            'grid_vals': self.grid_vals,
+            'bias_grid': self.bias_grid.detach().clone(),
+            'grid_vals': self.grid_vals.detach().clone(),
             'params': {
                 'cv_min': self.cv_min,
                 'cv_max': self.cv_max,
@@ -323,8 +323,9 @@ class BiasPotentialMultiDim:
         return coords_np, bias_np
 
     def state_dict(self):
+        """Return state dictionary for saving. Clones tensors so saved state is a snapshot."""
         return {
-            'bias_grid': self.bias_grid,
+            'bias_grid': self.bias_grid.detach().clone(),
             'params': {
                 'cv_min': self.cv_min.cpu().tolist(),
                 'cv_max': self.cv_max.cpu().tolist(),
