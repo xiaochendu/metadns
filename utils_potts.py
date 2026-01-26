@@ -598,15 +598,19 @@ def plot_1d_projected_energy(energy_grid_2d, cv_grid_coords,
     Formula: F(x) = -kT * log(∫ exp(-F(x,y)/kT) dy)
 
     Args:
-        energy_grid_2d: 2D energy grid [nx, ny]
+        energy_grid_2d: 2D energy grid [nx, ny] in eV
         cv_grid_coords: List of 1D coordinate arrays [x_coords, y_coords]
         project_dim: Dimension to project onto (0 for x, 1 for y)
-        kT: Temperature in energy units
+        kT: Temperature in energy units (eV). Should match units of energy_grid_2d.
         ax: Matplotlib axis
         label: Label for legend
         figsize: Figure size (width, height)
         fontsize: Font size for labels
         grid_alpha: Alpha for grid lines
+
+    Returns:
+        ax: Matplotlib axis with plotted 1D projected free energy profile.
+            Output units are the same as input energy units (eV if input is in eV).
     """
     energy_grid_2d = np.asarray(energy_grid_2d)
 
@@ -669,11 +673,11 @@ def plot_1d_projected_energy(energy_grid_2d, cv_grid_coords,
 
     ax.plot(cv_coords, f_projected, label=label, linewidth=1.5)
     ax.set_xlabel(xlabel, fontsize=fontsize)
-    ax.set_ylabel('Free Energy [arb. units]', fontsize=fontsize)
+    ax.set_ylabel('Free Energy (eV)', fontsize=fontsize)
     # Only set title if it hasn't been set yet (for multi-plot cases)
-    if ax.get_title() == '':
-        ax.set_title(
-            f"1D Projected Energy Profile (projected onto {xlabel})", fontsize=fontsize)
+    # if ax.get_title() == '':
+    #     ax.set_title(
+    #         f"1D Projected Energy Profile (projected onto {xlabel})", fontsize=fontsize)
     ax.grid(True, alpha=grid_alpha)
 
     # Don't create legend here - let caller handle it for multi-plot cases
