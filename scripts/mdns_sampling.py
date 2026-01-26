@@ -814,7 +814,30 @@ def run_sampling(
             cv_compute_fn = compute_cv_cuau
     
     # Select CV computation function and reward function based on model type
-    if args.model_type == "potts":
+    if args.model_type == "cuau":
+        # CuAu reward function using CuAuRewardWrapper
+        def get_reward_fn(default_temp_k, default_field, bias_pot=None):
+            # Create CuAuRewardWrapper instance
+            reward_wrapper = CuAuRewardWrapper(
+                energy_model=energy_model,
+                default_temp_k=default_temp_k
+            )
+            reward_wrapper.set_default_field(default_field)
+            
+            def reward_fn(x, beta=None, h=None, J=1, **kwargs):
+                """Reward function for CuAu model."""
+                # CuAuRewardWrapper expects beta and h, converts internally
+                return reward_wrapper(x, beta=beta, h=h, J=J, use_bias=False, 
+                                    bias_potential=None, cv_compute_fn=None)
+            
+            def biased_reward_fn(x, beta=None, h=None, J=1, use_bias=True):
+                """Biased reward function for CuAu model."""
+                # Use CuAuRewardWrapper with bias
+                return reward_wrapper(x, beta=beta, h=h, J=J, use_bias=use_bias,
+                                    bias_potential=bias_pot, cv_compute_fn=cv_compute_fn)
+            
+            return biased_reward_fn if args.use_bias else reward_fn
+    elif args.model_type == "potts":
         cv_compute_fn = compute_cv_potts
         # Potts reward function
         def get_reward_fn(default_beta, default_h, J=1, bias_pot=None):
@@ -1079,6 +1102,16 @@ def run_sampling(
             # Compute aggregate metrics
             # NESS using log_rnd (as requested)
             log_rnd_tensor = torch.tensor(log_rnd_values[key], device=device)
+            
+            # Diagnostic: log statistics about log_rnd distribution
+            log_rnd_mean = log_rnd_tensor.mean().item()
+            log_rnd_std = log_rnd_tensor.std().item()
+            log_rnd_min = log_rnd_tensor.min().item()
+            log_rnd_max = log_rnd_tensor.max().item()
+            log_rnd_range = log_rnd_max - log_rnd_min
+            logger.info(f"[{key}] log_rnd stats: mean={log_rnd_mean:.4f}, std={log_rnd_std:.4f}, "
+                       f"min={log_rnd_min:.4f}, max={log_rnd_max:.4f}, range={log_rnd_range:.4f}")
+            
             ness_val = ess(log_rnd_tensor, normalize=True)
             ness_values[key] = float(ness_val) if isinstance(ness_val, (float, int)) else ness_val.item()
             
