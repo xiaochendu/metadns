@@ -31,6 +31,7 @@ from model import ExponentialMovingAverage, get_rope_vit_model
 from model.transformer import MultiOutputTransformer
 from train_cuau import CuAuRewardWrapper, TransformerWrapper
 from utils import ess
+from utils_cuau import compute_order_parameter, get_sublattice_map
 from utils_ising import ising2d_ham, ising2d_mag
 from utils_potts import potts2d_ham, potts2d_magnetization_all
 from utils_train import _compute_log_stats, rnd
@@ -77,13 +78,17 @@ def parse_args() -> argparse.Namespace:
     
     # Bias Potential (WT-ASBS)
     parser.add_argument('--use_bias', action='store_true', help='Enable biased sampling (WT-ASBS)')
-    parser.add_argument('--bias_sigma', type=float, default=0.05, help='Sigma for Gaussian bias kernel')
+    parser.add_argument('--bias_method', type=str, default='gaussian', choices=['binned', 'gaussian'], 
+                       help='Bias method: binned (delta kernel) or gaussian (gaussian kernel)')
+    parser.add_argument('--bias_sigma', type=str, default='0.05', help='Sigma for Gaussian bias kernel (can be comma-separated for 2D CVs, e.g., "0.05,0.05")')
     parser.add_argument('--bias_height', type=float, default=0.1, help='Initial height (W) for bias kernel')
     parser.add_argument('--bias_factor', type=float, default=10.0, help='Bias factor (gamma) for Well-Tempered Metadynamics')
-    parser.add_argument('--bias_grid_size', type=int, default=100, help='Grid size for CV')
-    parser.add_argument('--kernel_type', type=str, default='gaussian', help='Kernel type: gaussian or delta')
-    parser.add_argument('--cv_min', type=str, default=None, help='Minimum value for CV (default: -1.0 for Ising, 0.0 for CuAu). For 2D CVs (Potts), use comma-separated values like "-0.6,-1.0"')
-    parser.add_argument('--cv_max', type=str, default=None, help='Maximum value for CV (default: 1.0 for Ising, 1.0 for CuAu). For 2D CVs (Potts), use comma-separated values like "1.1,1.0"')
+    parser.add_argument('--bias_grid_size', type=str, default='100', help='Grid size for CV (can be comma-separated for 2D CVs, e.g., "65,65")')
+    parser.add_argument('--kernel_type', type=str, default=None, help='Kernel type: gaussian or delta (deprecated, use --bias_method instead)')
+    parser.add_argument('--cv_type', type=str, default='composition', choices=['composition', 'composition_order'],
+                       help='CV type for CuAu: composition (1D) or composition_order (2D)')
+    parser.add_argument('--cv_min', type=str, default=None, help='Minimum value for CV (default: -1.0 for Ising, 0.0 for CuAu). For 2D CVs (Potts/CuAu composition_order), use comma-separated values like "-0.6,-1.0" or "0,0"')
+    parser.add_argument('--cv_max', type=str, default=None, help='Maximum value for CV (default: 1.0 for Ising, 1.0 for CuAu). For 2D CVs (Potts/CuAu composition_order), use comma-separated values like "1.1,1.0" or "1,1"')
     
     # Checkpoint
     parser.add_argument(
@@ -151,6 +156,18 @@ def parse_args() -> argparse.Namespace:
     
     args = parser.parse_args()
     
+    # Map bias_method to kernel_type (for backward compatibility)
+    if args.kernel_type is None:
+        # Use bias_method to determine kernel_type
+        args.kernel_type = "delta" if args.bias_method == "binned" else "gaussian"
+    else:
+        # If kernel_type is explicitly provided, use it (backward compatibility)
+        logger.warning("--kernel_type is deprecated, use --bias_method instead")
+        if args.kernel_type == "delta":
+            args.bias_method = "binned"
+        elif args.kernel_type == "gaussian":
+            args.bias_method = "gaussian"
+    
     # Parse cv_min and cv_max (can be comma-separated for 2D CVs)
     def parse_cv_value(cv_str, default):
         if cv_str is None:
@@ -162,10 +179,15 @@ def parse_args() -> argparse.Namespace:
             # Single value for 1D CV
             return float(cv_str)
     
-    # Set default CV ranges based on model type
+    # Set default CV ranges based on model type and cv_type
     if args.cv_min is None:
         if args.model_type == "cuau":
-            args.cv_min = 0.0
+            if args.cv_type == "composition_order":
+                # 2D CV: [composition, order_parameter]
+                args.cv_min = (0.0, 0.0)
+            else:
+                # 1D CV: composition only
+                args.cv_min = 0.0
         elif args.model_type == "potts":
             # For Potts with q=3, CV is 2D, default is (-0.6, -1.0)
             args.cv_min = (-0.6, -1.0)
@@ -175,7 +197,14 @@ def parse_args() -> argparse.Namespace:
         args.cv_min = parse_cv_value(args.cv_min, args.cv_min)
     
     if args.cv_max is None:
-        if args.model_type == "potts":
+        if args.model_type == "cuau":
+            if args.cv_type == "composition_order":
+                # 2D CV: [composition, order_parameter]
+                args.cv_max = (1.0, 1.0)
+            else:
+                # 1D CV: composition only
+                args.cv_max = 1.0
+        elif args.model_type == "potts":
             # For Potts with q=3, CV is 2D, default is (1.1, 1.0)
             args.cv_max = (1.1, 1.0)
         else:
@@ -417,8 +446,10 @@ def load_model(args, device):
                         logger.warning(f"Bias potential T value {T_val} seems to be in Kelvin. Converting.")
                         T_val = K_B * T_val
                 
-                # Use BiasPotentialMultiDim for Potts (2D CV), BiasPotential for Ising (1D CV)
-                if args.model_type == "potts":
+                # Use BiasPotentialMultiDim for Potts (2D CV) or CuAu with composition_order (2D CV)
+                # BiasPotential for Ising (1D CV) or CuAu with composition (1D CV)
+                use_2d_cv = (args.model_type == "potts") or (args.model_type == "cuau" and args.cv_type == "composition_order")
+                if use_2d_cv:
                     # Convert cv_min, cv_max, grid_size, sigma to lists if needed
                     def to_list(val):
                         if isinstance(val, tuple):
@@ -458,11 +489,19 @@ def load_model(args, device):
                         device=device
                     )
                 else:
+                    # 1D CV: parse string inputs if needed
+                    grid_size_val = params.get('grid_size', args.bias_grid_size)
+                    if isinstance(grid_size_val, str):
+                        grid_size_val = int(grid_size_val)
+                    sigma_val = params.get('sigma', args.bias_sigma)
+                    if isinstance(sigma_val, str):
+                        sigma_val = float(sigma_val)
+                    
                     bias_pot = BiasPotential(
                         cv_min=params.get('cv_min', args.cv_min), 
                         cv_max=params.get('cv_max', args.cv_max), 
-                        grid_size=params.get('grid_size', args.bias_grid_size),
-                        sigma=params.get('sigma', args.bias_sigma),
+                        grid_size=grid_size_val,
+                        sigma=sigma_val,
                         initial_height=params.get('initial_height', args.bias_height),
                         bias_factor=params.get('bias_factor', args.bias_factor),
                         T=T_val,
@@ -472,7 +511,8 @@ def load_model(args, device):
             else:
                 # Fallback to CLI args if params not inside state_dict
                 logger.warning("Bias params not found in checkpoint state dict! Using CLI arguments.")
-                if args.model_type == "potts":
+                use_2d_cv = (args.model_type == "potts") or (args.model_type == "cuau" and args.cv_type == "composition_order")
+                if use_2d_cv:
                     # Parse comma-separated values for Potts 2D CV
                     def parse_list_arg(arg):
                         if isinstance(arg, tuple):
@@ -509,10 +549,18 @@ def load_model(args, device):
                         device=device
                     )
                 else:
+                    # 1D CV: parse string inputs if needed
+                    grid_size_val = args.bias_grid_size
+                    if isinstance(grid_size_val, str):
+                        grid_size_val = int(grid_size_val)
+                    sigma_val = args.bias_sigma
+                    if isinstance(sigma_val, str):
+                        sigma_val = float(sigma_val)
+                    
                     bias_pot = BiasPotential(
                         cv_min=args.cv_min, cv_max=args.cv_max, 
-                        grid_size=args.bias_grid_size,
-                        sigma=args.bias_sigma,
+                        grid_size=grid_size_val,
+                        sigma=sigma_val,
                         initial_height=args.bias_height,
                         bias_factor=args.bias_factor,
                         T=T_init,
@@ -563,7 +611,8 @@ def load_model(args, device):
             
         else:
             logger.warning("Bias potential requested but not found in checkpoint! Using initialized (empty/initial) bias from CLI args.")
-            if args.model_type == "potts":
+            use_2d_cv = (args.model_type == "potts") or (args.model_type == "cuau" and args.cv_type == "composition_order")
+            if use_2d_cv:
                 # Parse comma-separated values for Potts 2D CV
                 def parse_list_arg(arg):
                     if isinstance(arg, tuple):
@@ -703,7 +752,7 @@ def run_sampling(
             return torch.tensor(concentrations[:, :-1], device=x.device if isinstance(x, torch.Tensor) else device, dtype=torch.float32)
     
     def compute_cv_cuau(x, energy_model_arg=None):
-        """Compute Au concentration CV for CuAu alloy.
+        """Compute Au concentration CV for CuAu alloy (1D).
         
         Args:
             x: Input configurations [B, L]
@@ -718,7 +767,53 @@ def run_sampling(
                 raise ValueError("Energy model required for CuAu sampling")
             return energy_model.get_concentrations(x)
     
+    def compute_cv_cuau_2d(x, energy_model_arg=None, sublattice_map=None, num_sites=None):
+        """Compute 2D CV [composition, order_parameter] for CuAu alloy.
+        
+        Args:
+            x: Input configurations [B, L]
+            energy_model_arg: Energy model instance (optional)
+            sublattice_map: Sublattice mapping tensor [L] (required for 2D CV)
+            num_sites: Total number of sites (required for 2D CV)
+        """
+        # Get composition (1D)
+        if energy_model_arg is not None:
+            comp = energy_model_arg.get_concentrations(x)
+        else:
+            if energy_model is None:
+                raise ValueError("Energy model required for CuAu sampling")
+            comp = energy_model.get_concentrations(x)
+        
+        # Get order parameter
+        if sublattice_map is None or num_sites is None:
+            raise ValueError("sublattice_map and num_sites required for composition_order CV")
+        order = compute_order_parameter(x, sublattice_map, num_sites)
+        
+        # Stack to [B, 2]
+        return torch.stack([comp, order], dim=1)
+    
     # Select CV computation function based on model type
+    # For CuAu, set up CV function based on cv_type
+    cuau_sublattice_map = None
+    cuau_num_sites = None
+    if args.model_type == "cuau":
+        if args.cv_type == "composition_order":
+            # 2D CV: need to precompute sublattice map
+            if energy_model is None:
+                raise ValueError("Energy model required for CuAu sampling with composition_order CV")
+            cuau_num_sites = args.size[0] * args.size[1] * args.size[2]
+            cuau_sublattice_map = get_sublattice_map(energy_model.atoms, tuple(args.size)).to(device)
+            # Create closure with sublattice_map
+            def cv_compute_fn_cuau_2d(x):
+                return compute_cv_cuau_2d(x, energy_model_arg=energy_model, 
+                                        sublattice_map=cuau_sublattice_map, 
+                                        num_sites=cuau_num_sites)
+            cv_compute_fn = cv_compute_fn_cuau_2d
+        else:
+            # 1D CV: composition only
+            cv_compute_fn = compute_cv_cuau
+    
+    # Select CV computation function and reward function based on model type
     if args.model_type == "potts":
         cv_compute_fn = compute_cv_potts
         # Potts reward function
@@ -892,7 +987,8 @@ def run_sampling(
                         raw_energy = energy_model.get_energy(x)  # [B] in eV
                         # Au concentration (x_up)
                         x_up_batch = energy_model.get_concentrations(x)  # [B]
-                        cv_val_for_bias = x_up_batch  # Same for CuAu
+                        # Use cv_compute_fn for bias evaluation (handles both 1D and 2D CVs)
+                        cv_val_for_bias = cv_compute_fn(x)  # [B] for 1D, [B, 2] for 2D
                     elif args.model_type == "potts":
                         # For Potts, use potts2d_ham
                         raw_energy = potts2d_ham(x, J=args.J, q=args.q)  # [B]
