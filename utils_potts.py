@@ -587,10 +587,69 @@ def visualize_potts(S, q, k_x, k_y):    # Convert to numpy if it's a torch tenso
     plt.tight_layout()
     return fig
 
+def project_energy_1d(energy_grid_2d, cv_grid_coords, project_dim, kT):
+    """Project 2D energy landscape to 1D by marginalizing over one dimension.
+    Similar to plot 'f' in the reference molecular system visualization.
+
+    Formula: F(x) = -kT * log(∫ exp(-F(x,y)/kT) dy)
+
+    Args:
+        energy_grid_2d: 2D energy grid [nx, ny] in eV
+        cv_grid_coords: List of 1D coordinate arrays [x_coords, y_coords]
+        project_dim: Dimension to project onto (0 for x, 1 for y)
+        kT: Temperature in energy units (eV). Should match units of energy_grid_2d.
+    
+    Returns:
+        cv_coords: 1D array of coordinates
+        f_projected: 1D array of projected free energies
+        xlabel: Label for the x-axis
+    """
+    energy_grid_2d = np.asarray(energy_grid_2d)
+
+    if project_dim == 0:
+        # Project onto x: marginalize over y
+        if cv_grid_coords[1].ndim == 2:
+            y_coords_1d = cv_grid_coords[1][0, :]
+        else:
+            y_coords_1d = cv_grid_coords[1]
+
+        exp_neg_energy = np.exp(-energy_grid_2d / kT)  # [nx, ny]
+        integral = np.trapz(exp_neg_energy, x=y_coords_1d, axis=1)  # [nx]
+        f_projected = -kT * np.log(integral + 1e-10)
+
+        if cv_grid_coords[0].ndim == 2:
+            cv_coords = cv_grid_coords[0][:, 0]
+        else:
+            cv_coords = cv_grid_coords[0]
+        xlabel = 'CV 1 (x)'
+    else:
+        # Project onto y: marginalize over x
+        if cv_grid_coords[0].ndim == 2:
+            x_coords_1d = cv_grid_coords[0][:, 0]
+        else:
+            x_coords_1d = cv_grid_coords[0]
+
+        exp_neg_energy = np.exp(-energy_grid_2d / kT)  # [nx, ny]
+        integral = np.trapz(exp_neg_energy, x=x_coords_1d, axis=0)  # [ny]
+        f_projected = -kT * np.log(integral + 1e-10)  # [ny]
+
+        if cv_grid_coords[1].ndim == 2:
+            cv_coords = cv_grid_coords[1][0, :]
+        else:
+            cv_coords = cv_grid_coords[1]
+        xlabel = 'CV 2 (y)'
+
+    # Shift to have minimum at 0
+    f_projected = f_projected - f_projected.min()
+
+    # Ensure cv_coords and f_projected are 1D arrays
+    cv_coords = np.asarray(cv_coords).flatten()
+    f_projected = np.asarray(f_projected).flatten()
+    return cv_coords, f_projected, xlabel
 
 def plot_1d_projected_energy(energy_grid_2d, cv_grid_coords,
                              project_dim=0, kT=1.0, ax=None, label=None,
-                             figsize=(2.28, 2.0), fontsize=8, grid_alpha=0.3):
+                             figsize=(2.28, 2.0), fontsize=8, grid_alpha=0.3, normalize_kT=False):
     """
     Project 2D energy landscape to 1D by marginalizing over one dimension.
     Similar to plot 'f' in the reference molecular system visualization.
@@ -607,73 +666,25 @@ def plot_1d_projected_energy(energy_grid_2d, cv_grid_coords,
         figsize: Figure size (width, height)
         fontsize: Font size for labels
         grid_alpha: Alpha for grid lines
-
+        normalize_kT: Normalize the free energy by kT
     Returns:
         ax: Matplotlib axis with plotted 1D projected free energy profile.
             Output units are the same as input energy units (eV if input is in eV).
     """
-    energy_grid_2d = np.asarray(energy_grid_2d)
 
-    if ax is None:
-        fig, ax = plt.subplots(figsize=figsize)
+    # Use the extracted helper in main function
+    cv_coords, f_projected, xlabel = project_energy_1d(
+        energy_grid_2d, cv_grid_coords, project_dim, kT
+    )
 
-    if project_dim == 0:
-        # Project onto x: marginalize over y
-        # F(x) = -kT * log(∫ exp(-F(x,y)/kT) dy)
-        # Extract 1D coordinate arrays from meshgrid
-        # cv_grid_coords[0] is (nx, ny) meshgrid where rows are constant
-        # cv_grid_coords[1] is (nx, ny) meshgrid where columns are constant
-        if cv_grid_coords[1].ndim == 2:
-            # Extract 1D y-coords from first row of meshgrid
-            y_coords_1d = cv_grid_coords[1][0, :]
-        else:
-            y_coords_1d = cv_grid_coords[1]
-
-        exp_neg_energy = np.exp(-energy_grid_2d / kT)  # [nx, ny]
-        integral = np.trapz(
-            exp_neg_energy, x=y_coords_1d, axis=1)  # [nx]
-        # [nx] (add small epsilon for numerical stability)
-        f_projected = -kT * np.log(integral + 1e-10)
-
-        # Extract 1D x-coords from first column of meshgrid
-        if cv_grid_coords[0].ndim == 2:
-            # First column has unique x-values
-            cv_coords = cv_grid_coords[0][:, 0]
-        else:
-            cv_coords = cv_grid_coords[0]
-        xlabel = 'CV 1 (x)'
+    if normalize_kT:
+        f_projected = f_projected / kT
+        ax.set_ylabel(r'Free Energy ($/k_\text{B}T$)', fontsize=fontsize)
     else:
-        # Project onto y: marginalize over x
-        # Extract 1D coordinate arrays from meshgrid
-        if cv_grid_coords[0].ndim == 2:
-            # Extract 1D x-coords from first column of meshgrid
-            x_coords_1d = cv_grid_coords[0][:, 0]
-        else:
-            x_coords_1d = cv_grid_coords[0]
-
-        exp_neg_energy = np.exp(-energy_grid_2d / kT)  # [nx, ny]
-        integral = np.trapz(
-            exp_neg_energy, x=x_coords_1d, axis=0)  # [ny]
-        f_projected = -kT * np.log(integral + 1e-10)  # [ny]
-
-        # Extract 1D y-coords from first row of meshgrid
-        if cv_grid_coords[1].ndim == 2:
-            # First row has unique y-values
-            cv_coords = cv_grid_coords[1][0, :]
-        else:
-            cv_coords = cv_grid_coords[1]
-        xlabel = 'CV 2 (y)'
-
-    # Shift to have minimum at 0
-    f_projected = f_projected - f_projected.min()
-
-    # Ensure cv_coords and f_projected are 1D arrays (flatten if needed)
-    cv_coords = np.asarray(cv_coords).flatten()
-    f_projected = np.asarray(f_projected).flatten()
+        ax.set_ylabel('Free Energy', fontsize=fontsize)
 
     ax.plot(cv_coords, f_projected, label=label, linewidth=1.5)
     ax.set_xlabel(xlabel, fontsize=fontsize)
-    ax.set_ylabel('Free Energy (eV)', fontsize=fontsize)
     # Only set title if it hasn't been set yet (for multi-plot cases)
     # if ax.get_title() == '':
     #     ax.set_title(
