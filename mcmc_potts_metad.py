@@ -9,12 +9,8 @@ import torch
 import wandb
 from tqdm import tqdm
 
-# Add snowy-flow to path if needed, assuming MDNS and snowy-flow-dev are siblings
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../snowy-flow-dev')))
-
-from snowyflow.model.energy.ising import LatticePottsModel
-
 from bias import BiasPotentialMultiDim
+from potts import LatticePottsModel
 from utils import plot_bias_analysis_2d
 from utils_potts import potts2d_ham
 
