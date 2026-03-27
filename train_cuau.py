@@ -267,6 +267,12 @@ def get_args():
     parser.add_argument("--eval_every", type=int, default=20, help="Evaluate every N steps")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume_from_ckpt", type=str, default=None)
+    parser.add_argument("--use_anneal", action="store_true",
+                        help="Pre-train at a high temperature before main training")
+    parser.add_argument("--anneal_temp", type=float, default=None,
+                        help="Warm-up temperature in Kelvin (must be >= temp_max). Required when --use_anneal is set.")
+    parser.add_argument("--anneal_epochs", type=int, default=None,
+                        help="Number of warm-up steps. Required when --use_anneal is set.")
     
     # Temps
     parser.add_argument("--temp_min", type=float, default=300.0)
@@ -351,6 +357,11 @@ def setup_energy_model(args, device):
 
 def main():
     args = get_args()
+
+    if args.use_anneal:
+        assert args.anneal_temp is not None, "--anneal_temp must be specified when --use_anneal is set"
+        assert args.anneal_epochs is not None, "--anneal_epochs must be specified when --use_anneal is set"
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)
     
@@ -566,39 +577,18 @@ def main():
             bias_potential.load_state_dict(checkpoint["bias_potential"])
 
     # 6. Prepare Temps/Fields for Training
-    # utils_train expects args.temps as list or array if multi-temp
-    # Let's generate a linear schedule of temperatures (as betas)
-    # CuAu T range: temp_min to temp_max
-    # beta = 1/(kB * T). Here we use T directly since reward wrapper maps it?
-    # No, utils_train passes beta to model. 
-    # Our TransformerWrapper converts beta -> temp = 1/beta.
-    # So we should pass beta = 1/T.
-    
-    # But wait, reward_fn uses beta too: log_reward = -beta * E
-    # Ideally, beta should be 1/(kB*T). 
-    # For CuAu, units are eV typically. kB = 8.617e-5 eV/K.
-    # So beta = 1 / (kB * T).
-    # If we pass this beta to TransformerWrapper:
-    #   temp = 1/beta = kB * T.  Transformer expects physical T?
-    #   MultiOutputTransformer.thermo_embedder embeds 'temp'. 
-    #   If it expects K, we need to pass T (in K).
-    #   If we pass 1/(kB*T) as beta, then temp = kB*T (energy units).
-    #   This might need scaling in TransformerWrapper or just train with energy units.
-    #   Usually fine if consistent.
-    
-    # Set temps array for utils_train
-    # For single temp case, utils_train won't use args.temps (use_multi_temp_field=False)
-    # But we set it anyway for consistency. Note: get_temp_field_batch expects temps in Kelvin
-    # and computes beta = 1/T. So we pass temps in Kelvin, not scaled by kB.
+    # utils_train expects args.temps as list or array if multi-temp.
+    # get_temp_field_batch treats temps as 1/T (beta-like) when passed through
+    # TransformerWrapper, which converts beta -> temp = 1/beta (energy units).
+    # We pass temperatures in Kelvin; the reward wrapper handles kB scaling internally.
     temps_k = np.linspace(args.temp_min, args.temp_max, args.num_temps)
-    args.temps = temps_k  # Pass temperatures in Kelvin (not scaled by kB)
-    args.fields = np.array([args.field]) # Use provided field
+    args.temps = temps_k  # temperatures in Kelvin
+    args.fields = np.array([args.field])
 
     print("Starting training with utils_train.train...")
-    
-    # Create validation plotting callback
+
+    # Validation plotting callback (shared across phases)
     def validation_plot_callback(x, temps, fields, wandb_run=None, step=None):
-        """Callback function for plotting energy and Au concentration distributions during validation."""
         plot_energy_au_conc_distributions(
             x=x,
             energy_model=energy_model,
@@ -609,14 +599,11 @@ def main():
             step=step,
             title_suffix=" (MDNS)",
         )
-    
-    utils_train.train(
+
+    common_train_kwargs = dict(
         model=net,
         optimizer=optimizer,
-        reward_fn=reward_fn,
-        args=args,
         device=device,
-        num_epochs=args.n_steps,
         ema=ema,
         wandb_run=wandb_run,
         bias_potential=bias_potential,
@@ -630,6 +617,75 @@ def main():
         buffer_strategy=args.buffer_strategy,
         plot_bias_fn=plot_bias_analysis_2d if args.cv_type == "composition_order" else None,
     )
+
+    if not args.use_anneal:
+        utils_train.train(
+            reward_fn=reward_fn,
+            args=args,
+            num_epochs=args.n_steps,
+            **common_train_kwargs,
+        )
+    else:
+        # ── Phase 1: warm-up at anneal_temp (high temperature) ─────────────────
+        print(f"\n=== Annealing warm-up: {args.anneal_temp} K for {args.anneal_epochs} steps ===")
+
+        # Build an args copy that points to a single warm-up temperature
+        args_anneal = copy.copy(args)
+        args_anneal.temps = np.array([args.anneal_temp])
+        args_anneal.num_temps = 1
+        args_anneal.fields = np.array([args.field])
+
+        # Build a warm-up reward wrapper at anneal_temp
+        reward_fn_anneal = CuAuRewardWrapper(energy_model, default_temp_k=args.anneal_temp)
+        if args.field != 0.0:
+            reward_fn_anneal.set_default_field(args.field)
+
+        if args.use_bias:
+            def create_biased_anneal_reward(base_reward, bias_pot, cv_fn):
+                def biased(x, beta=None, h=None, J=1, use_bias=True):
+                    return base_reward(x, beta=beta, h=h, J=J, use_bias=use_bias,
+                                      bias_potential=bias_pot, cv_compute_fn=cv_fn)
+                return biased
+            reward_fn_anneal_wrapped = create_biased_anneal_reward(
+                reward_fn_anneal, bias_potential, cv_compute_fn_final
+            )
+        else:
+            reward_fn_anneal_wrapped = reward_fn_anneal
+
+        utils_train.train(
+            reward_fn=reward_fn_anneal_wrapped,
+            args=args_anneal,
+            num_epochs=args.anneal_epochs,
+            **common_train_kwargs,
+        )
+
+        # Save warm-up checkpoint
+        utils_train.save_checkpoint(
+            net, optimizer, ema,
+            [], [], [],  # losses / ess lists reset between phases
+            vars(args_anneal),
+            os.path.join(args.out_dir, "weights_warmup.pth"),
+            bias_potential,
+        )
+        print(f"Warm-up checkpoint saved to {args.out_dir}/weights_warmup.pth")
+
+        # ── Phase 2: main training at target temperature range ──────────────────
+        print(f"\n=== Main training: {args.temp_min}–{args.temp_max} K for {args.n_steps} steps ===")
+
+        utils_train.train(
+            reward_fn=reward_fn,
+            args=args,
+            num_epochs=args.n_steps,
+            **common_train_kwargs,
+        )
+
+        utils_train.save_checkpoint(
+            net, optimizer, ema,
+            [], [], [],
+            vars(args),
+            os.path.join(args.out_dir, "weights_final.pth"),
+            bias_potential,
+        )
 
 if __name__ == "__main__":
     main()
