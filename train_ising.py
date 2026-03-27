@@ -257,6 +257,8 @@ if not args.use_anneal:
         ess_eval = []
         current_fields = None
         rng = None
+        bias_state = None
+        buffer_state = None
 
     # Initialize BiasPotential if enabled
     bias_pot = None
