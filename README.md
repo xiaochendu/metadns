@@ -2,11 +2,12 @@
 
 [![Paper (ICML 2026)](https://img.shields.io/badge/ICML%202026-MetaDNS-blue)](https://openreview.net/forum?id=OY7Qe2ZSx9)
 [![Code](https://img.shields.io/badge/Code-GitHub-181717?logo=github)](https://github.com/xiaochendu/metadns)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20301979.svg)](https://doi.org/10.5281/zenodo.20301979)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Welcome to the official implementation of **MetaDNS** — a framework that combines **learned sampling** with **Well-Tempered Metadynamics (WT-ASBS)** to train <span style="color:#A020F0">**neural samplers**</span> for discrete distributions, with enhanced exploration of complex free energy landscapes.
+Welcome to the official implementation of **MetaDNS** - a framework that combines **learned sampling** with **Well-Tempered Metadynamics (WT-MetaD)** to train <span style="color:#A020F0">**neural samplers**</span> for discrete distributions, with enhanced exploration of complex free energy landscapes.
 
-> Builds on **MDNS** (NeurIPS 2025) — [paper](https://openreview.net/forum?id=xIH95kXNR2), [arXiv:2508.10684](https://arxiv.org/abs/2508.10684).
+> Builds on **MDNS** (NeurIPS 2025) - [paper](https://openreview.net/forum?id=xIH95kXNR2), [arXiv:2508.10684](https://arxiv.org/abs/2508.10684).
 
 ![Demonstration](assets/metadns_framework.png)
 
@@ -48,12 +49,12 @@ metadns/
 MetaDNS deposits one Gaussian hill per sample, per deposition cycle, along low-dimensional
 collective variables. Key knobs:
 
-- **`--bias_height`** — the *total* height deposited per cycle, in the standard
+- **`--bias_height`** - the *total* height deposited per cycle, in the standard
   metadynamics range of $0.1\!-\!0.5\,k_BT$. It is divided by `--batch_size` internally so
   the deposited bias is independent of batch size (disable with `--no_normalize_bias_by_batch`).
-- **`--bias_factor`** ($\gamma$) — the well-tempered factor; we use `10`.
-- **`--bias_sigma`** — the hill width; we use `0.05`.
-- **`--bias_grid_size`** — CV grid resolution; scales with system size.
+- **`--bias_factor`** ($\gamma$) - the well-tempered factor; we use `10`.
+- **`--bias_sigma`** - the hill width; we use `0.05`.
+- **`--bias_grid_size`** - CV grid resolution; scales with system size.
 
 ## Training
 
@@ -109,16 +110,16 @@ python train_cuau.py \
 ## Checkpoints
 
 Pre-trained **MetaDNS** checkpoints (with trained bias potentials) for all systems, sizes,
-and temperatures are hosted on **Zenodo** (DOI: _to be finalized upon publication_).
+and temperatures are hosted on **Zenodo**: <https://doi.org/10.5281/zenodo.20301979>.
 Download the `data_{ising,potts,cuau}.tar.gz` archives and extract them into `checkpoints/`
-— this is the single data root shared by the sampling commands and the example notebooks
+- this is the single data root shared by the sampling commands and the example notebooks
 below. After extraction the layout is `checkpoints/<system>/{mdns,metadns,...}/<run>/`. The
-full set of reference run commands — including the MCMC, Swendsen–Wang, and WT-ASBS
-baselines — ships alongside the checkpoints as `MetaDNS_run_commands.md`.
+full set of reference run commands - including the MCMC, Swendsen–Wang, and WT-ASBS
+baselines - ships alongside the checkpoints as `MetaDNS_run_commands.md`.
 
 ## Sampling
 
-`scripts/mdns_sampling.py` draws samples from a trained MetaDNS checkpoint — the
+`scripts/mdns_sampling.py` draws samples from a trained MetaDNS checkpoint - the
 `checkpoints/<system>/metadns/...` paths below come from the Zenodo release extracted as
 described above. The bias potential is loaded automatically from the checkpoint; the
 `--bias_*` arguments should match the values used during training (see the paper appendix).
@@ -179,14 +180,14 @@ and (when metadynamics is used) the bias-potential grid and collective-variable 
 
 Two example reproduction notebooks are included under `examples/`:
 
-- `examples/ising_16x16_benchmark.ipynb` — Ising L=16 distribution and free-energy
+- `examples/ising_16x16_benchmark.ipynb` - Ising L=16 distribution and free-energy
   comparison (paper Figure 2).
-- `examples/cuau_4x4x4_benchmark.ipynb` — Cu-Au 4×4×4 concentration and free-energy
+- `examples/cuau_4x4x4_benchmark.ipynb` - Cu-Au 4×4×4 concentration and free-energy
   results (paper Figure 5).
 
 Each notebook reads benchmark sample and checkpoint files from the Zenodo data release.
 Download `data_ising.tar.gz` and `data_cuau.tar.gz` and extract them into `checkpoints/`
-— the default data root — then run the notebooks (no further configuration needed).
+- the default data root - then run the notebooks (no further configuration needed).
 To read the data from a different location, set the `METADNS_DATA_ROOT` environment
 variable. The complete set of reproduction notebooks covering every paper figure ships
 with the Zenodo release.
