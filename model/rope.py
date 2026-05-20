@@ -93,8 +93,8 @@ class RotaryPositionalEmbeddingsBase(nn.Module):
             - n_h: num heads
             - h_d: head dim
 
-        TODO: The implementation below can be made more efficient
-        for inference.
+        Note: the current implementation is designed for training; a
+        key-value cache could reduce redundant computation at inference time.
         """
         # input tensor has shape [b, s, n_h, h_d]
         seq_len = x.size(1)

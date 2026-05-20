@@ -258,7 +258,7 @@ def get_args():
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--eval_batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--n_steps", type=int, default=100000) # num_epochs in train
+    parser.add_argument("--num_epochs", type=int, default=100000, help="Number of training steps")
     parser.add_argument("--resample_every_n_step", type=int, default=10)
     parser.add_argument("--wdce_num_replicates", type=int, default=8, help="Replicates for WDCE")
     parser.add_argument("--grad_clip", action="store_true")
@@ -283,7 +283,8 @@ def get_args():
     
     # Metadynamics / Bias
     parser.add_argument("--use_bias", action="store_true", help="Use metadynamics bias")
-    parser.add_argument("--bias_method", type=str, default="binned", choices=["binned", "gaussian"])
+    parser.add_argument("--kernel_type", type=str, default="gaussian", choices=["gaussian", "delta"],
+                        help="Bias kernel type: 'gaussian' (Gaussian hill) or 'delta' (binned histogram)")
     parser.add_argument("--bias_sigma", type=str, default="0.05", help="Sigma for Gaussian bias kernel (can be list)")
     parser.add_argument("--bias_height", type=float, default=0.1, 
                         help="Initial bias height. For diffusion samplers with batch updates, this is normalized by batch_size by default (see --normalize_bias_by_batch)")
@@ -305,7 +306,8 @@ def get_args():
                         help="Buffer storage strategy: fifo or balanced")
     
     # Logging
-    parser.add_argument("--out_dir", type=str, default="results/cuau")
+    parser.add_argument("--dir_name", type=str, default="results/cuau",
+                        help="Output directory for checkpoints and logs")
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="mdns-cuau")
     parser.add_argument("--wandb_run_name", type=str, default=None)
@@ -363,10 +365,10 @@ def main():
         assert args.anneal_epochs is not None, "--anneal_epochs must be specified when --use_anneal is set"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(args.dir_name, exist_ok=True)
     
     # Save config
-    with open(os.path.join(args.out_dir, 'config.json'), 'w') as f:
+    with open(os.path.join(args.dir_name, 'config.json'), 'w') as f:
         json.dump(vars(args), f, indent=4)
 
     wandb_run = None
@@ -376,7 +378,7 @@ def main():
             project=args.wandb_project, 
             name=args.wandb_run_name,
             config=args,
-            dir=args.out_dir,
+            dir=args.dir_name,
             mode=wandb_mode
         )
     
@@ -516,10 +518,10 @@ def main():
         else:
             print(f"Bias height (no normalization): {effective_bias_height:.6f} eV per hill")
         
-        print(f"Initializing Bias: method={args.bias_method}, CV={args.cv_type}")
+        print(f"Initializing Bias: kernel_type={args.kernel_type}, CV={args.cv_type}")
         print(f"Temperature: {T_kelvin} K = {T_val:.6f} eV (kB*T)")
-        
-        kernel_type = "delta" if args.bias_method == "binned" else "gaussian"
+
+        kernel_type = args.kernel_type
         
         if args.cv_type == "composition":
              print(f"1D Bias: sigma={bias_sigma}, factor={args.bias_factor}, CV range=[{cv_min}, {cv_max}]")
@@ -594,7 +596,7 @@ def main():
             energy_model=energy_model,
             temps=temps,
             fields=fields,
-            save_path=os.path.join(args.out_dir, f"distributions_step_{step}.png") if step is not None else None,
+            save_path=os.path.join(args.dir_name, f"distributions_step_{step}.png") if step is not None else None,
             wandb_run=wandb_run,
             step=step,
             title_suffix=" (MDNS)",
@@ -607,7 +609,7 @@ def main():
         ema=ema,
         wandb_run=wandb_run,
         bias_potential=bias_potential,
-        save_dir=args.out_dir,
+        save_dir=args.dir_name,
         cfg_dict=vars(args),
         validation_plot_callback=validation_plot_callback,
         cv_compute_fn=cv_compute_fn_final,
@@ -622,9 +624,18 @@ def main():
         utils_train.train(
             reward_fn=reward_fn,
             args=args,
-            num_epochs=args.n_steps,
+            num_epochs=args.num_epochs,
             **common_train_kwargs,
         )
+        # Save final checkpoint after training completes
+        utils_train.save_checkpoint(
+            net, optimizer, ema,
+            [], [], [],
+            vars(args),
+            os.path.join(args.dir_name, "weights.pth"),
+            bias_potential,
+        )
+        print(f"Final checkpoint saved to {args.dir_name}/weights.pth")
     else:
         # ── Phase 1: warm-up at anneal_temp (high temperature) ─────────────────
         print(f"\n=== Annealing warm-up: {args.anneal_temp} K for {args.anneal_epochs} steps ===")
@@ -664,18 +675,18 @@ def main():
             net, optimizer, ema,
             [], [], [],  # losses / ess lists reset between phases
             vars(args_anneal),
-            os.path.join(args.out_dir, "weights_warmup.pth"),
+            os.path.join(args.dir_name, "weights_warmup.pth"),
             bias_potential,
         )
-        print(f"Warm-up checkpoint saved to {args.out_dir}/weights_warmup.pth")
+        print(f"Warm-up checkpoint saved to {args.dir_name}/weights_warmup.pth")
 
         # ── Phase 2: main training at target temperature range ──────────────────
-        print(f"\n=== Main training: {args.temp_min}–{args.temp_max} K for {args.n_steps} steps ===")
+        print(f"\n=== Main training: {args.temp_min}–{args.temp_max} K for {args.num_epochs} steps ===")
 
         utils_train.train(
             reward_fn=reward_fn,
             args=args,
-            num_epochs=args.n_steps,
+            num_epochs=args.num_epochs,
             **common_train_kwargs,
         )
 
@@ -683,7 +694,7 @@ def main():
             net, optimizer, ema,
             [], [], [],
             vars(args),
-            os.path.join(args.out_dir, "weights_final.pth"),
+            os.path.join(args.dir_name, "weights_final.pth"),
             bias_potential,
         )
 

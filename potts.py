@@ -1,5 +1,6 @@
 """Energy model and energy-based sampling for Potts model."""
 
+import logging
 from typing import Literal
 
 import igraph as ig
@@ -182,7 +183,7 @@ class LatticePottsModel(nn.Module):
             samples = starting_samples.long()
         else:
             samples = self.init_sample(n_samples)
-        print(f"Generating {n_samples:d} samples from {self!s:s}")
+        logging.debug("Generating %d samples from %s", n_samples, str(self))
         for _ in tqdm(range(gt_steps)):
             samples = self.sampler.step(samples, self, temps, fields, time=time).detach()
         return samples.detach().cpu()

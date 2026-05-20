@@ -50,6 +50,7 @@ parser.add_argument('--cv_min', type=str, default="-0.6,-1.0", help="Min CV boun
 parser.add_argument('--cv_max', type=str, default="1.1,1.0", help="Max CV bounds (comma-separated list of floats, supports N-dimensions)")
 parser.add_argument('--scale_bias_with_size', action='store_true', help='Scale bias Delta_T with system size')
 parser.add_argument('--no_normalize_bias_by_batch', dest='normalize_bias_by_batch', action='store_false', default=True, help="Disable bias height norm by batch size")
+parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility')
 parser.add_argument('--save_every', type=int, default=10000, help='Save checkpoint every N steps')
 parser.add_argument('--buffer_size', type=int, default=0, help='Replay buffer size')
 parser.add_argument('--buffer_ratio', type=float, default=0.0, help='Ratio of buffer samples in batch')
@@ -136,7 +137,7 @@ cfg = {'tokens': q,
        'grad_clip': False, 'gradnorm_clip': 1,
        'loss_fn': args.loss_fn,
        'wdce_num_replicates': args.wdce_num_replicates,
-       'seed': None,
+       'seed': args.seed,
        'use_bias': args.use_bias,
        'bias_sigma': args.bias_sigma,
        'bias_height': args.bias_height,

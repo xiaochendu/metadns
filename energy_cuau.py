@@ -475,7 +475,8 @@ class ClusterExpansionModel:
         Returns:
             (B,) tensor of energies in units of k_B*T.
         """
-        # TODO: generalize for more than 2 elements
+        # Note: currently supports binary (Cu/Au) systems only;
+        # extend mus construction here to support more than 2 elements.
         mus = torch.stack([torch.zeros_like(fields), fields], dim=1)
         return self.get_energy(x, temps, mus, time)
 
@@ -638,11 +639,9 @@ class AuCuAlloyModel:
         # Calculate reference energies for pure compositions
         self.atoms.numbers = np.ones(self.num_sites) * 29
         self.U_cu = self.atoms.get_potential_energy()  # potential energy of pure Cu
-        print("PURE CU ENERGY:", self.U_cu)
 
         self.atoms.numbers = np.ones(self.num_sites) * 79
         self.U_au = self.atoms.get_potential_energy()  # potential energy of pure Au
-        print("PURE AU ENERGY:", self.U_au)
         self.bias = torch.ones(self.num_sites).float() * 0.0
         self.init_dist = dists.Bernoulli(logits=2 * self.bias)
 
@@ -705,7 +704,8 @@ class AuCuAlloyModel:
         Returns:
             A torch tensor representing the energy of the lattices.
         """
-        # TODO parallelize this; it is the bottleneck
+        # Note: the per-lattice loop below is the main compute bottleneck;
+        # parallelisation across samples would improve throughput for large batches.
         energies = torch.zeros(lattices.shape[0]).to(lattices.device)
         for lattice_num in range(lattices.shape[0]):
             energies[lattice_num] = self.get_cluster_energy(lattices[lattice_num, :])

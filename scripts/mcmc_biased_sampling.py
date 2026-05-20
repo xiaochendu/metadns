@@ -9,7 +9,6 @@ Outputs follow the same format as mdns_sampling.py for compatibility.
 import argparse
 import json
 import logging
-import os
 import pickle as pkl
 import sys
 from pathlib import Path
@@ -23,12 +22,7 @@ from tqdm import tqdm
 mdns_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(mdns_root))
 
-# Add snowy-flow to path if needed
-snowy_flow_path = os.path.abspath(os.path.join(mdns_root, '../snowy-flow-dev'))
-if os.path.exists(snowy_flow_path):
-    sys.path.insert(0, snowy_flow_path)
-
-from snowyflow.model.energy.ising import LatticePottsModel
+from baselines.energy.ising import LatticePottsModel
 
 from bias import BiasPotential, BiasPotentialMultiDim
 from mcmc_potts_metad import BiasedLatticePottsModel, compute_cv_potts
@@ -283,8 +277,11 @@ def load_bias_from_checkpoint(checkpoint_path: str, device: torch.device, args: 
             checkpoint_args = checkpoint["args"]
             cv_type_from_checkpoint = checkpoint_args.get("cv_type")
         
-        # Use cv_type from args if available, otherwise infer from dimensions
-        if hasattr(args, 'cv_type') and args.cv_type:
+        # Use cv_type from args only for CuAu (where it's a meaningful choice).
+        # For Potts, infer from the checkpoint's own cv_min dimensions to avoid
+        # the default "composition" value incorrectly selecting a 1D BiasPotential
+        # when the checkpoint contains a 2D BiasPotentialMultiDim (no grid_vals key).
+        if args.model_type == "cuau" and hasattr(args, 'cv_type') and args.cv_type:
             cv_type = args.cv_type
         elif cv_type_from_checkpoint:
             cv_type = cv_type_from_checkpoint

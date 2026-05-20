@@ -1050,8 +1050,8 @@ def _visualize_lattices(samples, L, n_rows=2, n_cols=5, max_samples=16,
 
 
 def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=None,
-          losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None, 
-          bias_potential=None, current_fields=None, rng=None, save_dir=None, cfg_dict=None,
+          losses=None, ess_train=None, ess_eval=None, wandb_run=None, L=None,
+          bias_potential=None, current_temps=None, current_fields=None, rng=None, save_dir=None, cfg_dict=None,
           validation_plot_callback=None, cv_compute_fn=None,
           buffer_size=0, buffer_ratio=0.0, buffer_n_bins=1, buffer_strategy='fifo', plot_bias_fn=None,
           buffer_state_dict=None, start_epoch=0):
@@ -1190,6 +1190,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                     "train/field_mean": float(h_batch.cpu().mean().item()),
                     "train/field_std": float(h_batch.cpu().std().item()),
                 }
+        loss = None
         if args.loss_fn == 'wdce':
             with torch.no_grad():
                 if x_saved is None or epoch % args.resample_every_n_step == 0:
@@ -1203,11 +1204,7 @@ def train(model, optimizer, reward_fn, args, device, num_epochs = 10000, ema=Non
                 else:
                     x, log_rnd = x_saved, log_rnd_saved
                     is_fresh_sample = False
-
-            # Note: train_ddp doesn't have multi-temp/field setup, so pass None
-            loss = loss_wdce(model, log_rnd, x,
-                                num_replicates=args.wdce_num_replicates,
-                                beta_batch=None, h_batch=None)
+            # loss will be computed below after optional replay-buffer mixing
         else:
             x, log_rnd = rnd(model, reward_fn, args.batch_size, device=device,
                              beta_batch=beta_batch, h_batch=h_batch, J=args.J if hasattr(args, 'J') else 1)
