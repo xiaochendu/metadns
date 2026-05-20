@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "metadns"
 version = "1.0.0"
-description = "MetaDNS: Metadynamics-enhanced Masked Diffusion Neural Sampler (ICML 2026)"
+description = "MetaDNS: Enhancing Exploration in Discrete Neural Samplers via Metadynamics (ICML 2026)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Xiaochen Du", email = "xiaochen.du@mit.edu" },
+    { name = "Xiaochen Du", email = "dux@outlook.sg" },
 ]
 dependencies = [
     "torch<=2.5.1",
