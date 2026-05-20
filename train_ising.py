@@ -72,6 +72,7 @@ parser.add_argument('--cv_min', type=float, default=-1.0, help='Minimum value fo
 parser.add_argument('--cv_max', type=float, default=1.0, help='Maximum value for CV')
 parser.add_argument('--no_normalize_bias_by_batch', dest='normalize_bias_by_batch', action='store_false', default=True,
                     help='Disable normalization of bias_height by batch_size (default: normalization enabled). Recommended for diffusion samplers that deposit bias more frequently than traditional MCMC.')
+parser.add_argument('--seed', type=int, default=None, help='Random seed for reproducibility')
 parser.add_argument('--save_every', type=int, default=10000, help='Save checkpoint every N steps')
 parser.add_argument('--hidden_size', type=int, default=64, help='Model hidden size')
 parser.add_argument('--n_blocks', type=int, default=4, help='Number of transformer blocks')
@@ -135,7 +136,7 @@ cfg = {'tokens': 2,
        'grad_clip': False, 'gradnorm_clip': 1,
        'loss_fn': args.loss_fn,
        'wdce_num_replicates': args.wdce_num_replicates,
-       'seed': None,
+       'seed': args.seed,
        'temps': temps,
        'fields': fields,
        'sample_delta_temp': sample_delta_temp,

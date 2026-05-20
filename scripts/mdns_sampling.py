@@ -413,16 +413,16 @@ def load_model(args, device):
     # Initialize BiasPotential if requested
     bias_pot = None
     if args.use_bias:
+        # Reference temperature for bias-potential initialization. Defined here so it
+        # is available to both the checkpoint-bias branch and the CLI-fallback branch.
+        # Checkpoint T should already be in eV for CuAu (converted during training).
+        T_init = args.temps[0] if args.temps else 1.0
+        if args.model_type == "cuau":
+            T_init = K_B * T_init  # Convert Kelvin to eV for fallback initialization
         if 'bias_potential' in checkpoint:
             logger.info("Loading BiasPotential from checkpoint")
             bias_state = checkpoint['bias_potential']
-            
-            # For CuAu, convert temperature from Kelvin to energy units (eV) for initialization
-            # But checkpoint T should already be in eV (converted during training)
-            T_init = args.temps[0] if args.temps else 1.0
-            if args.model_type == "cuau":
-                T_init = K_B * T_init  # Convert Kelvin to eV for fallback initialization
-            
+
             # Check if params exist in state_dict (saved by modern bias.py)
             if 'params' in bias_state:
                 params = bias_state['params']
@@ -649,10 +649,17 @@ def load_model(args, device):
                     device=device
                 )
             else:
+                # 1D CV: coerce string CLI inputs to numeric (as the other branches do)
+                grid_size_val = args.bias_grid_size
+                if isinstance(grid_size_val, str):
+                    grid_size_val = int(grid_size_val)
+                sigma_val = args.bias_sigma
+                if isinstance(sigma_val, str):
+                    sigma_val = float(sigma_val)
                 bias_pot = BiasPotential(
-                    cv_min=args.cv_min, cv_max=args.cv_max, 
-                    grid_size=args.bias_grid_size,
-                    sigma=args.bias_sigma,
+                    cv_min=args.cv_min, cv_max=args.cv_max,
+                    grid_size=grid_size_val,
+                    sigma=sigma_val,
                     initial_height=args.bias_height,
                     bias_factor=args.bias_factor,
                     T=T_init,

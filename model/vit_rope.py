@@ -266,8 +266,6 @@ class RopeVIT(vit_models):
         self.length = img_size ** 2
         self.vocab_embed = VocabEmbedding(dim=self.embed_dim, vocab_dim=self.vocab_size)
         self.head = nn.Linear(self.embed_dim, self.vocab_size)
-        # self.head.weight.data.zero_()
-        # self.head.bias.data.zero_()
         self.dtype = {'float64': torch.float64,
                       'float32': torch.float32,
                       'float16': torch.float16,

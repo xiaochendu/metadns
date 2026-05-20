@@ -1,0 +1,59 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Experiment outputs (large; download from Zenodo)
+outputs/
+exp_local/
+runs/
+wandb/
+
+# Checkpoints (large; hosted on Zenodo — see README for download link)
+checkpoints/
+
+# LaTeX build artifacts
+MetaDNS-icml2026_offline/
+*.synctex.gz
+*.aux
+*.log
+*.bbl
+*.blg
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.pdf
+
+# Data / database files generated at runtime
+aucu_dft.db
+
+# Agent scratch space
+.agent/
+.claude/
+.pytest_cache/
